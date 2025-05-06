@@ -21,6 +21,7 @@ MOD_PATHS = [
 # Local content directory
 LOCAL_CONTENT = Path(__file__).resolve().parent.parent / "content"
 
+REGISTRY: Dict[str, Union[List[BaseModel], Dict[str, BaseModel]]] = {}
 
 def is_valid_folder(path: Path) -> bool:
     return (
@@ -85,7 +86,7 @@ def register_content(folders: List[Path]) -> Dict[str, Union[List[BaseModel], Di
             for json_file in sorted(sub.glob("*.json")):
                 try:
                     data = json.loads(json_file.read_text(encoding="utf-8"))
-                    instance = model_cls.parse_obj(data)
+                    instance = model_cls.model_validate(data)
                     if model_name in id_models:
                         key = getattr(instance, 'id')
                         registry[model_name][key] = instance
@@ -98,11 +99,12 @@ def register_content(folders: List[Path]) -> Dict[str, Union[List[BaseModel], Di
 
 
 def main():
+    global REGISTRY
     # Combine mod paths and local content
     all_sources = [LOCAL_CONTENT] + MOD_PATHS
-    registry = register_content(all_sources)
+    REGISTRY = register_content(all_sources)
     # Summary output
-    for model_name, collection in registry.items():
+    for model_name, collection in REGISTRY.items():
         count = len(collection)
         kind = 'entries'
         print(f"Loaded {count} {model_name} {kind}.")
