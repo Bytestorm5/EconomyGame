@@ -1,7 +1,7 @@
 from __future__ import annotations
 from decimal import Decimal
 from enum import Enum
-from typing import Dict, List, Literal, Optional, Tuple
+from typing import Any, Dict, List, Literal, Optional, Tuple
 from pydantic import BaseModel, Field, PositiveInt, field_validator, model_validator, root_validator, validator, PositiveFloat
 import itertools
 _id_counter = itertools.count()
@@ -9,44 +9,111 @@ _id_counter = itertools.count()
 def get_instance_id():
     return next(_id_counter)
 
+
 # ────────────────────────────────────────────────────────────────────────────
-# Utility: Condition / Effect (unchanged stubs – keep until DSL is defined)
+# Condition / Effect DSL
 # ────────────────────────────────────────────────────────────────────────────
 
-_SimpleCond = str | Dict[str, str]
-
-class _AtCountParams(BaseModel):
-    """Parameters for atLeast, atMost, exactly operations"""
-
-    n: int = Field(..., ge=0)
-    conditions: List[ConditionBlock]
+def _get_attr(obj: Any, path: str) -> Any:
+    attrs = path.split('.')
+    val = obj
+    for a in attrs:
+        if val is None:
+            return None
+        if isinstance(val, dict):
+            val = val.get(a)
+        else:
+            val = getattr(val, a, None)
+    return val
 
 class ConditionBlock(BaseModel):
-    """Recursive condition block supporting logical ops and counts"""
+    """Represents logical conditions evaluated in a given context."""
+    AND: Optional[List['ConditionBlock']] = None
+    OR: Optional[List['ConditionBlock']] = None
+    NOT: Optional['ConditionBlock'] = None
+    scope: Optional[str] = Field(default='self', description='Context key for target object')
+    attribute: Optional[str] = None
+    operator: Optional[Literal['==','!=','>','<','>=','<=','in','not_in']] = None
+    value: Optional[Any] = None
+    count_scope: Optional[str] = None
+    count_operator: Optional[Literal['==','!=','>','<','>=','<=']] = None
+    count_value: Optional[int] = None
 
-    condition: Optional[_SimpleCond] = None
-    AND: Optional[List["ConditionBlock"]] = None
-    OR: Optional[List["ConditionBlock"]] = None
-    NOT: Optional["ConditionBlock"] = None
-    atLeast: Optional[_AtCountParams] = None
-    atMost: Optional[_AtCountParams] = None
-    exactly: Optional[_AtCountParams] = None
+    def evaluate(self, context: Dict[str, Any]) -> bool:
+        if self.AND is not None:
+            return all(cond.evaluate(context) for cond in self.AND)
+        if self.OR is not None:
+            return any(cond.evaluate(context) for cond in self.OR)
+        if self.NOT is not None:
+            return not self.NOT.evaluate(context)
+        if self.count_scope:
+            lst = context.get(self.count_scope, [])
+            cnt = len(lst) if isinstance(lst, list) else 0
+            return eval(f"{cnt} {self.count_operator} {self.count_value}")
+        obj = context.get(self.scope)
+        if obj is None or not self.attribute or not self.operator:
+            return False
+        left = _get_attr(obj, self.attribute)
+        right = self.value
+        expr = f"left {self.operator} right"
+        return bool(eval(expr, {'left': left, 'right': right}))
 
-ConditionBlock.model_rebuild()
+class Effect(BaseModel):
+    """Represents an effect applied to an object in context."""
+    scope: str = Field(default='self')
+    attribute: str
+    action: Literal['set','add','remove'] = 'set'
+    value: Any
 
-_SimpleEffect = str | Dict[str, str]
+    def apply(self, context: Dict[str, Any]) -> None:
+        obj = context.get(self.scope)
+        if obj is None or not self.attribute:
+            return
+        parts = self.attribute.split('.')
+        target = obj
+        for p in parts[:-1]:
+            if isinstance(target, dict):
+                target = target.get(p)
+            else:
+                target = getattr(target, p, None)
+            if target is None:
+                return
+        key = parts[-1]
+        if self.action == 'set':
+            if isinstance(target, dict):
+                target[key] = self.value
+            else:
+                setattr(target, key, self.value)
+        elif self.action == 'add':
+            current = _get_attr(obj, self.attribute) or 0
+            new = current + self.value
+            if isinstance(target, dict):
+                target[key] = new
+            else:
+                setattr(target, key, new)
+        elif self.action == 'remove' and isinstance(target, list):
+            try:
+                target.remove(self.value)
+            except ValueError:
+                pass
 
-class _IFSEntry(BaseModel):
-    """Conditional branch applying effects when 'condition' holds"""
-
+class IFSEntry(BaseModel):
     condition: ConditionBlock
-    effect: List[_SimpleEffect]
+    effects: List[Effect]
 
 class EffectBlock(BaseModel):
-    """Defines base effects and optional named IFS branches"""
+    """Defines base effects and optional named IFS branches."""
+    effects: List[Effect] = Field(default_factory=list)
+    IFS: Dict[str, List[IFSEntry]] = Field(default_factory=dict)
 
-    effect: List[_SimpleEffect] = Field(default_factory=list)
-    IFS: Dict[str, List[_IFSEntry]] = Field(default_factory=dict)
+    def apply(self, context: Dict[str, Any]) -> None:
+        for eff in self.effects:
+            eff.apply(context)
+        for entries in self.IFS.values():
+            for entry in entries:
+                if entry.condition.evaluate(context):
+                    for eff in entry.effects:
+                        eff.apply(context)
 
 # ────────────────────────────────────────────────────────────────────────────
 # Resources
@@ -74,11 +141,26 @@ class Resource(BaseModel):
     cost_per: Decimal = Field(..., description="Cost per 1 unit of this resource")
     type: ResourceType
     market_behavior: str
+    # whether this resource is treated as a speculative asset (price-driven trading)
+    is_speculative: bool = Field(default=False, description="Flag to enable speculative trading of this resource")
+    # Units needed per tick for each need tier: survival, comfort, luxury
+    needs: Dict[str, Decimal] = Field(
+        default_factory=lambda: {"survival": Decimal("0"), "comfort": Decimal("0"), "luxury": Decimal("0")},
+        description="Units needed per tick for survival, comfort, and luxury tiers"
+    )
 
     # allow int/float literals in JSON/YAML configs
     @validator("cost_per", pre=True)
     def _decimize(cls, v):  # noqa: N805 – pydantic validator name convention
         return Decimal(str(v))
+    
+    @validator("needs", pre=True)
+    def _decimize_needs(cls, v):  # noqa: N805
+        # ensure all need thresholds are Decimal
+        try:
+            return {k: Decimal(str(val)) for k, val in v.items()}
+        except Exception:
+            raise ValueError(f"Invalid needs mapping: {v}")
     
 class _ResourceStack(BaseModel):
     amount: PositiveInt
@@ -219,6 +301,8 @@ class MachineDefinition(BaseModel):
     # Maps recipe ids to timesteps taken to execute the recipe
     # If None, use the default defined in the conversion
     possible_recipes: Dict[str, int | None]
+    # marks this machine as a point-of-sale retail terminal
+    is_retail: bool = Field(default=False, description="Whether this machine acts as a storefront cashier")
 
     # coercion to Decimal for resource dictionaries
     @validator("consumes_idle", "consumes_active", pre=True)
@@ -332,6 +416,13 @@ class BuildingDefinition(BaseModel):
     loading_bays: PositiveInt
     parking_spots: PositiveInt
     
+    # real estate parameters
+    is_single_family: bool = Field(default=False, description="If true, entire building sells as single unit")
+    sale_multiplier: Decimal = Field(default=Decimal('1.0'), description="Multiplier on cost to set sale price")
+    rent_yield_per_tick: Decimal = Field(default=Decimal('0.01'), description="Portion of sale price paid as rent per tick")
+    mortgage_term: int = Field(default=360, description="Number of ticks for mortgage term")
+    mortgage_rate: Decimal = Field(default=Decimal('0.005'), description="Interest rate per tick for mortgage loans")
+    
     building_type: BuildingType
 
     @validator("cost", pre=True)
@@ -355,6 +446,8 @@ class _BuildingInstance(BaseModel):
     
     loading_bay_occupants: List[str]
     parking_occupants: List[str]
+    # stocks of resources at this building for supply chain
+    resources: _ResourceAmounts = Field(default_factory=dict, description="Building-level resource stocks for internal supply chain")
 
     # ── Convenience --------------------------------------------------------
     def add_unit(self, unit: _UnitInstance) -> None:
@@ -465,9 +558,13 @@ class _FinancialEntityInstance(BaseModel):
     # Building ids
     buildings: List[int]
     land_owned: List[int]
+    # loans for financed purchases
+    loans: List["Loan"] = Field(default_factory=list)
 
 class _CompanyInstance(_FinancialEntityInstance):
     techs: List[str]
+    # history of profits and losses for adaptive pricing
+    profit_history: List[Decimal] = Field(default_factory=list)
 
 # Simple resource‑conversion recipe (updated to reference machine *IDs*)
 class ResourceConversion(BaseModel):
@@ -589,6 +686,10 @@ class _PersonInstance(_FinancialEntityInstance):
     
     employer_id: Optional[int]
     works_at: Optional[int]
+    # home building where person resides or stores goods
+    home_building_id: Optional[int]
+    # id of personal vehicle
+    personal_vehicle_id: Optional[int]
     
     inventory: _Inventory
 
@@ -597,6 +698,34 @@ class _PersonInstance(_FinancialEntityInstance):
         cap = 5
         values['inventory'] = _Inventory(capacity=cap)
         return values
+    # brand impressions: positive means preferred, negative means avoided
+    brand_impressions: Dict[int, Decimal] = Field(default_factory=dict)
+
+class Loan(BaseModel):
+    loan_id: int = Field(default_factory=get_instance_id)
+    principal: Decimal
+    remaining_balance: Decimal
+    rate: Decimal  # interest rate per tick
+    term: int      # total number of ticks
+    remaining_term: int
+    payment_per_tick: Decimal
+
+class RealEstateListing(BaseModel):
+    listing_id: int = Field(default_factory=get_instance_id)
+    building_id: int
+    unit_id: Optional[int] = None  # None for whole-building listings
+    is_sale: bool  # True=sale, False=lease
+    sale_price: Decimal
+    lease_price: Optional[Decimal] = None
+
+class _Shipment(BaseModel):
+    shipment_id: int = Field(default_factory=get_instance_id)
+    resource_id: str
+    quantity: Decimal
+    origin_building_id: Optional[int] = None
+    dest_building_id: Optional[int] = None
+    dest_person_id: Optional[int] = None
+    status: Literal["pending","delivered"] = "pending"
 
 class _WorldState(BaseModel):
     land: Dict[str, _LandParcel] = Field(default_factory=dict)
@@ -604,5 +733,9 @@ class _WorldState(BaseModel):
     companies: Dict[int, _CompanyInstance] = Field(default_factory=dict)
     population: Dict[int, _PersonInstance] = Field(default_factory=dict)
     vehicles: Dict[int, _VehicleInstance] = Field(default_factory=dict)
+    # pending shipments for physical delivery
+    shipments: List[_Shipment] = Field(default_factory=list)
+    # active real estate listings (cleared and regenerated each tick)
+    listings: List["RealEstateListing"] = Field(default_factory=list)
 
     # ── Helper methods -----------------------------------------------------
