@@ -2,6 +2,10 @@
 
 This document captures the key design goals that have guided the development of our agent-based economic simulation framework, as well as a roadmap of future enhancements and areas where the system can evolve.
 
+## Broad Goal:
+
+Design a game where one or more players can play as companies in a detailed economic siumulation. Players are competing with each other as well as a wide variety of AI companies providing different goods and services.
+
 ## 1. General Design Goals
 
 1. Moddable, Data-Driven Architecture
