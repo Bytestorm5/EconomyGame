@@ -63,9 +63,15 @@ class OrgQueryInput(BaseModel):
     depth: int = Field(1, ge=1, le=5)
 
 
+class AssetQueryType(str, Enum):
+    BUILDING = "building"
+    UNIT = "unit"
+    MACHINE = "machine"
+
+
 class AssetQueryInput(BaseModel):
-    unit_id: Optional[int] = None
-    filters: Optional[Dict[str, str]] = None
+    type: AssetQueryType = Field(..., description="What asset level to query")
+    id: Optional[int] = Field(None, description="Building/Unit/Machine id")
 
 
 class KPIQueryInput(BaseModel):
@@ -130,6 +136,10 @@ class Toolset:
         self.world = world
         self.tick = tick_provider
 
+    def _role_of(self, person: G._PersonInstance) -> Optional[G.JobRole]:
+        slot = self.world.jobs.get(person.job_slot_id) if person.job_slot_id else None
+        return slot.role if slot else None
+
     # ---- Query Tools ----
     @tool("org_query")
     def org_query(self, data: OrgQueryInput) -> str:
@@ -149,11 +159,30 @@ class Toolset:
 
     @tool("asset_query")
     def asset_query(self, data: AssetQueryInput) -> str:
-        """Return building/unit assets as JSON."""
+        """Return building, unit, or machine details as JSON."""
         import json
-        if data.unit_id is not None:
-            unit = self.world.buildings.get(data.unit_id)
-            return json.dumps(unit.model_dump() if unit else {})
+        if data.type == AssetQueryType.BUILDING:
+            if data.id is None:
+                return json.dumps({})
+            b = self.world.buildings.get(data.id)
+            return json.dumps(b.model_dump() if b else {})
+        if data.type == AssetQueryType.UNIT:
+            if data.id is None:
+                return json.dumps({})
+            for b in self.world.buildings.values():
+                u = b.units.get(data.id)
+                if u:
+                    return json.dumps(u.model_dump())
+            return json.dumps({})
+        if data.type == AssetQueryType.MACHINE:
+            if data.id is None:
+                return json.dumps({})
+            for b in self.world.buildings.values():
+                for u in b.units.values():
+                    for m in u.machines:
+                        if m.instance_id == data.id:
+                            return json.dumps(m.model_dump())
+            return json.dumps({})
         return json.dumps({})
 
     @tool("kpi_query")
@@ -192,6 +221,7 @@ class Toolset:
         actor = self.world.population.get(data.actor_id)
         if not actor:
             return "invalid_actor"
+        role = self._role_of(actor)
         if data.action == StaffAction.APPLY:
             slot = self.world.jobs.get(int(data.target_team_id or 0))
             if slot and slot.person_id is None:
@@ -199,6 +229,62 @@ class Toolset:
                 actor.job_slot_id = slot.instance_id
                 actor.memory.add_short(f"Applied and placed in slot {slot.instance_id}")
                 return f"apply:{slot.instance_id}"
+            return "invalid_slot"
+        if data.action == StaffAction.HIRE:
+            if role not in [G.JobRole.manager, G.JobRole.director, G.JobRole.executive]:
+                return "forbidden"
+            person = self.world.population.get(data.target_person_id or -1)
+            if not person:
+                return "no_person"
+            slot = self.world.jobs.get(int(data.target_team_id or 0))
+            if not slot or slot.person_id is not None:
+                return "invalid_slot"
+            slot.person_id = person.instance_id
+            person.job_slot_id = slot.instance_id
+            person.employer_id = actor.employer_id
+            actor.memory.add_short(f"Hired {person.instance_id} into slot {slot.instance_id}")
+            return f"hire:{slot.instance_id}"
+        if data.action == StaffAction.FIRE:
+            if role not in [G.JobRole.manager, G.JobRole.director, G.JobRole.executive]:
+                return "forbidden"
+            person = self.world.population.get(data.target_person_id or -1)
+            if not person or person.job_slot_id is None:
+                return "no_person"
+            slot = self.world.jobs.get(person.job_slot_id)
+            if slot:
+                slot.person_id = None
+            person.job_slot_id = None
+            actor.memory.add_short(f"Fired {person.instance_id}")
+            return "fire"
+        if data.action == StaffAction.PROMOTE:
+            if role not in [G.JobRole.manager, G.JobRole.director, G.JobRole.executive]:
+                return "forbidden"
+            person = self.world.population.get(data.target_person_id or -1)
+            if not person or person.job_slot_id is None:
+                return "no_person"
+            slot = self.world.jobs.get(person.job_slot_id)
+            if not slot:
+                return "no_slot"
+            new_role = G.JobRole(data.target_role) if data.target_role else slot.role
+            slot.role = new_role
+            actor.memory.add_short(f"Promoted {person.instance_id} to {new_role.value}")
+            return "promote"
+        if data.action == StaffAction.TRANSFER:
+            if role not in [G.JobRole.manager, G.JobRole.director, G.JobRole.executive]:
+                return "forbidden"
+            person = self.world.population.get(data.target_person_id or -1)
+            if not person or person.job_slot_id is None:
+                return "no_person"
+            new_slot = self.world.jobs.get(int(data.target_team_id or 0))
+            if not new_slot or new_slot.person_id is not None:
+                return "invalid_slot"
+            old_slot = self.world.jobs.get(person.job_slot_id)
+            if old_slot:
+                old_slot.person_id = None
+            new_slot.person_id = person.instance_id
+            person.job_slot_id = new_slot.instance_id
+            actor.memory.add_short(f"Transferred {person.instance_id} to slot {new_slot.instance_id}")
+            return "transfer"
         actor.memory.add_short(f"Staff action {data.action}")
         return "noop"
 
@@ -208,6 +294,27 @@ class Toolset:
         actor = self.world.population.get(data.actor_id)
         if not actor:
             return "invalid_actor"
+        role = self._role_of(actor)
+        company = self.world.companies.get(actor.employer_id or -1)
+        if not company:
+            return "no_company"
+
+        def find_department(dept_id: int):
+            for seg in company.segments.values():
+                if dept_id in seg.departments:
+                    return seg.departments[dept_id]
+            return None
+
+        if data.action == StructureAction.CREATE_TEAM:
+            if role not in [G.JobRole.manager, G.JobRole.director, G.JobRole.executive]:
+                return "forbidden"
+            dept = find_department(data.parent_id) if data.parent_id is not None else None
+            if not dept:
+                return "no_department"
+            team_id = f"team{len(dept.teams)+1}"
+            dept.teams[team_id] = G._Team(id=team_id, name=data.new_name or team_id)
+            actor.memory.add_short(f"Created team {team_id}")
+            return f"create_team:{team_id}"
         actor.memory.add_short(f"structure:{data.action}")
         return "ok"
 
@@ -217,6 +324,22 @@ class Toolset:
         actor = self.world.population.get(data.actor_id)
         if not actor:
             return "invalid_actor"
+        role = self._role_of(actor)
+        if role not in [G.JobRole.lead, G.JobRole.manager, G.JobRole.director, G.JobRole.executive]:
+            return "forbidden"
+        if data.action == AssetAction.ADD_MACHINE:
+            if data.unit_id is None or not data.machine_type:
+                return "missing_params"
+            machine_def = self.world.registry.get("MachineDefinition", {}).get(data.machine_type)
+            if not machine_def:
+                return "bad_machine"
+            for b in self.world.buildings.values():
+                unit = b.units.get(data.unit_id)
+                if unit:
+                    unit.add_machine(machine_def, active=False)
+                    actor.memory.add_short(f"Added machine {data.machine_type} to unit {data.unit_id}")
+                    return "add_machine"
+            return "no_unit"
         actor.memory.add_short(f"asset:{data.action}")
         return "ok"
 
