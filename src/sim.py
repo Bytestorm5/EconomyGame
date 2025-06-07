@@ -9,6 +9,7 @@ from pydantic import BaseModel, Field
 from register import register_content, MOD_PATHS, LOCAL_CONTENT
 import objects as G
 from objects import get_instance_id
+from llm_agents import PersonAgent, CompanyAgent
 
 # Constants
 WORLD_STATE_PATH = Path("world_state.json")
@@ -27,12 +28,18 @@ ConvDefs: Dict[str, G.ResourceConversion] = REGISTRY.get("ResourceConversion", {
 def load_world() -> G._WorldState:
     if WORLD_STATE_PATH.exists():
         raw = WORLD_STATE_PATH.read_text(encoding="utf-8")
-        return G._WorldState.model_validate_json(raw)
-    return G._WorldState()
+        world = G._WorldState.model_validate_json(raw)
+        world.registry = REGISTRY
+        return world
+    w = G._WorldState()
+    w.registry = REGISTRY
+    return w
 
 
 def save_world(world: G._WorldState) -> None:
-    WORLD_STATE_PATH.write_text(world.model_dump_json(), encoding="utf-8")
+    data = world.model_dump()
+    data.pop("registry", None)
+    WORLD_STATE_PATH.write_text(G._WorldState(**data).model_dump_json(), encoding="utf-8")
 
 # -----------------------------------
 # Order Book
@@ -218,34 +225,22 @@ class MarketBehavior(Behavior):
                         comp.resources['money'] = comp.resources.get('money', Decimal(0)) + price * qty
 
 class CompanyBehavior(Behavior):
+    def __init__(self) -> None:
+        self.agent = CompanyAgent()
+
     def tick(self, world: G._WorldState, markets: Dict[str, Market], tick: int):
         for comp in world.companies.values():
-            for conv in ConvDefs.values():
-                for res_id, amt in conv.input_resources.items():
-                    market = markets[res_id]
-                    # When placing orders, base limit_price on fair price (excluding specific supplier)
-                    price = market.price
-                    order = Order(
-                        actor_type='company', actor_id=comp.instance_id,
-                        resource_id=res_id, quantity=amt,
-                        limit_price=price, side='buy', timestamp=tick
-                    )
-                    market.order_book.submit(order)
+            action = self.agent.act(comp, world, tick)
+            comp.resources.setdefault("log", []).append(action)
 
 class PersonBehavior(Behavior):
+    def __init__(self) -> None:
+        self.agent = PersonAgent()
+
     def tick(self, world: G._WorldState, markets: Dict[str, Market], tick: int):
         for person in world.population.values():
-            for res_id, market in markets.items():
-                res_def = ResourceDefs.get(res_id)
-                if not getattr(res_def, 'is_physical', False):
-                    continue
-                if market.get_available_supply('person') >= Decimal(1):
-                    order = Order(
-                        actor_type='person', actor_id=person.instance_id,
-                        resource_id=res_id, quantity=Decimal(1),
-                        limit_price=market.price, side='buy', timestamp=tick
-                    )
-                    market.order_book.submit(order)
+            action = self.agent.act(person, world, tick)
+            person.memory.add_short(f"tick {tick}: {action}")
 
 class MachineBehavior(Behavior):
     """
