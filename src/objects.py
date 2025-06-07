@@ -3,6 +3,8 @@ from decimal import Decimal
 from enum import Enum
 from typing import Dict, List, Literal, Optional, Tuple
 from pydantic import BaseModel, Field, PositiveInt, field_validator, model_validator, root_validator, validator, PositiveFloat
+
+MAX_MANAGED_WORKERS = 8
 import itertools
 _id_counter = itertools.count()
 
@@ -253,7 +255,7 @@ class _MachineInstance(BaseModel):
     
     inventory: _Inventory
 
-    @model_validator(pre=True)
+    @model_validator(mode="before")
     def init_inventory(cls, values):
         machine_def = values.get('machine')
         cap = machine_def.inventory_capacity or 0
@@ -284,6 +286,7 @@ class _UnitInstance(BaseModel):
 
     instance_id: int = get_instance_id()
     owner_company_id: str
+    access_team_ids: List[str] = Field(default_factory=list)
     floor_space: PositiveInt = Field(..., description="Maximum usable space in tiles")
     machines: List[_MachineInstance] = Field(default_factory=list)
 
@@ -421,7 +424,7 @@ class VehicleDefinition(BaseModel):
     fuel_capacity: Decimal = Field(..., description="How many units of fuel it can hold")
     cargo_inventory_size: Decimal
 
-    @validator("max_speed", "fuel_consumption", "fuel_capacity", "stored_resources", pre=True)
+    @validator("max_speed", "fuel_consumption", "fuel_capacity", pre=True)
     def to_decimal(cls, v):
         return Decimal(str(v))
 
@@ -441,7 +444,7 @@ class _VehicleInstance(BaseModel):
     inventory: _Inventory
     fuel_stored: Decimal
 
-    @model_validator(pre=True)
+    @model_validator(mode="before")
     def init_inventory(cls, values):
         vehicle_def: VehicleDefinition = values.get('vehicle_type')
         cap = vehicle_def.cargo_inventory_size or 0
@@ -468,6 +471,9 @@ class _FinancialEntityInstance(BaseModel):
 
 class _CompanyInstance(_FinancialEntityInstance):
     techs: List[str]
+    domain: Optional[str] = None
+    executive_slots: List[_JobSlot] = Field(default_factory=list)
+    segments: Dict[str, _BusinessSegment] = Field(default_factory=dict)
 
 # Simple resource‑conversion recipe (updated to reference machine *IDs*)
 class ResourceConversion(BaseModel):
@@ -487,68 +493,82 @@ class ResourceConversion(BaseModel):
 # Individuals
 # ────────────────────────────────────────────────────────────────────────────
 
-class _Personality(BaseModel):
-    """
-    Vaguely follows the HEXACO personality traits.
-    """
-    openness: float # openness to new experience- imaginative/philosophical vs. uncreative/unintellectual
-    conscientiousness: float # efficient/organized vs. haphazrd/careless
-    extraversion: float # bold/energetic vs. shy/bashful
-    agreeableness: float # sympathetic/cooperative vs. cold/competitive
-    emotionality: float # moody/nervous vs. relaxed/calm
-    honesty: float # honest, loyal, modest vs. deceitful, greedy, pretentious
-    
-    @classmethod
-    def random(cls):
-        """Return a randomly generated `_Personality` instance.
+class _PersonalityTrait(BaseModel):
+    """Personality trait definition for LLM prompts (instance object)."""
+    id: str
+    description: str
+    coincidence: Dict[str, float] = Field(default_factory=dict)
 
-        Each trait is drawn from a *trait‑specific Gaussian Mixture Model* (GMM)
-        followed by `np.tanh` to squash the real‑valued draw into (‑1, 1).
-        The GMM parameters were chosen to echo patterns seen in large public
-        HEXACO datasets: some traits skew high, others are more balanced, and
-        emotionality skews low.  All implementation logic lives inside this
-        single method so the class stays self‑contained.
-        """
-        import numpy as np  # local import keeps method standalone
 
-        # (mean, std, weight) tuples for each trait
-        mixtures = {
-            "openness": [ 
-                (1.0, 0.5, 0.65), # high‑creativity majority
-                (-0.5, 0.4, 0.35) # low-creativity minority
-            ],  
-            "conscientiousness": [
-                (1.2, 0.4, 0.70), 
-                (-0.3, 0.6, 0.30)
-            ],
-            "extraversion": [
-                (0.8, 0.6, 0.45),  # outgoing
-                (0.0, 0.4, 0.35),  # ambivert
-                (-0.8, 0.6, 0.20),  # introvert
-            ],
-            "agreeableness": [
-                (0.8, 0.6, 0.35),  # highly cooperative
-                (0.0, 0.4, 0.45),  # average
-                (-0.8, 0.6, 0.20),  # competitive
-            ],
-            "emotionality": [
-                (-1.0, 0.5, 0.55),  # calm majority
-                (0.3, 0.6, 0.45),   # more anxious minority
-            ],
-            "honesty": [
-                (1.1, 0.4, 0.60), 
-                (-0.2, 0.7, 0.40)
-            ],
-        }
+class PersonMemory(BaseModel):
+    """Short and long term memory for individuals."""
+    short_term: List[str] = Field(default_factory=list)
+    long_term: Dict[str, str] = Field(default_factory=dict)
 
-        sampled = {}
-        for trait, comps in mixtures.items():
-            mus, sigmas, weights = zip(*comps)
-            idx = np.random.choice(len(comps), p=weights)
-            raw_value = np.random.normal(mus[idx], sigmas[idx])
-            sampled[trait] = float(np.tanh(raw_value))
+    def add_short(self, entry: str) -> None:
+        self.short_term.append(entry)
+        if len(self.short_term) > 30:
+            self.short_term.pop(0)
 
-        return cls(**sampled)
+
+class EmailMessage(BaseModel):
+    """Simple email object for inter-agent communication."""
+
+    message_id: int = Field(default_factory=get_instance_id)
+    sender_type: Literal["person", "company"]
+    sender_id: int
+    to_people: List[int] = Field(default_factory=list)
+    to_companies: List[int] = Field(default_factory=list)
+    subject: str
+    body: str
+    timestamp: int
+
+
+class JobRole(str, Enum):
+    """Hierarchy of job roles."""
+    operator = "operator"
+    lead = "lead"
+    manager = "manager"
+    director = "director"
+    executive = "executive"
+
+
+class _JobSlot(BaseModel):
+    """Dynamic assignment of a job role within a company."""
+    instance_id: int = get_instance_id()
+    role: JobRole
+    required_education: List[str] = Field(default_factory=list)
+    applicant_ids: List[int] = Field(default_factory=list)
+    person_id: Optional[int] = None
+    team_id: Optional[str] = None
+    department_id: Optional[str] = None
+    segment_id: Optional[str] = None
+
+
+class _Team(BaseModel):
+    id: str
+    name: str
+    unit_ids: List[str] = Field(default_factory=list)
+    budget: Decimal = Decimal(0)
+    lead_slot: _JobSlot = Field(default_factory=lambda: _JobSlot(role=JobRole.lead))
+    operator_slots: List[_JobSlot] = Field(default_factory=list)
+
+
+class _Department(BaseModel):
+    id: str
+    name: str
+    manager_slots: List[_JobSlot] = Field(default_factory=list)
+    teams: Dict[str, _Team] = Field(default_factory=dict)
+    budget: Decimal = Decimal(0)
+
+
+class _BusinessSegment(BaseModel):
+    id: str
+    name: str
+    director_slots: List[_JobSlot] = Field(default_factory=list)
+    departments: Dict[str, _Department] = Field(default_factory=dict)
+    inventory_for_sale: Dict[str, Decimal] = Field(default_factory=dict)
+    budget: Decimal = Decimal(0)
 
 class EducationCategory(BaseModel):
     id: str
@@ -584,15 +604,20 @@ class EducationCategory(BaseModel):
         return None
     
 class _PersonInstance(_FinancialEntityInstance):
-    personality: _Personality = _Personality.random()
+    personality_traits: List[str] = Field(default_factory=list)
+    memory: PersonMemory = Field(default_factory=PersonMemory)
     education: Optional[EducationCategory]
+
+    job_slot_id: Optional[int] = None
+
+    domain: Optional[str] = None
     
     employer_id: Optional[int]
     works_at: Optional[int]
     
     inventory: _Inventory
 
-    @model_validator(pre=True)
+    @model_validator(mode="before")
     def init_inventory(cls, values):
         cap = 5
         values['inventory'] = _Inventory(capacity=cap)
@@ -604,5 +629,10 @@ class _WorldState(BaseModel):
     companies: Dict[int, _CompanyInstance] = Field(default_factory=dict)
     population: Dict[int, _PersonInstance] = Field(default_factory=dict)
     vehicles: Dict[int, _VehicleInstance] = Field(default_factory=dict)
+    registry: Dict[str, dict] = Field(default_factory=dict)
+    emails: List[EmailMessage] = Field(default_factory=list)
+    internet: Dict[str, str] = Field(default_factory=dict)
+
+    jobs: Dict[int, _JobSlot] = Field(default_factory=dict)
 
     # ── Helper methods -----------------------------------------------------
