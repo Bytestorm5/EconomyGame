@@ -471,6 +471,8 @@ class _FinancialEntityInstance(BaseModel):
 class _CompanyInstance(_FinancialEntityInstance):
     techs: List[str]
     domain: Optional[str] = None
+    executive_slots: List[_JobSlot] = Field(default_factory=list)
+    segments: Dict[str, _BusinessSegment] = Field(default_factory=dict)
 
 # Simple resource‑conversion recipe (updated to reference machine *IDs*)
 class ResourceConversion(BaseModel):
@@ -490,8 +492,8 @@ class ResourceConversion(BaseModel):
 # Individuals
 # ────────────────────────────────────────────────────────────────────────────
 
-class PersonalityTrait(BaseModel):
-    """Static personality trait definition for LLM prompts."""
+class _PersonalityTrait(BaseModel):
+    """Personality trait definition for LLM prompts (instance object)."""
     id: str
     description: str
     coincidence: Dict[str, float] = Field(default_factory=dict)
@@ -519,6 +521,48 @@ class EmailMessage(BaseModel):
     subject: str
     body: str
     timestamp: int
+
+
+class JobRole(str, Enum):
+    """Hierarchy of job roles."""
+    operator = "operator"
+    lead = "lead"
+    manager = "manager"
+    director = "director"
+    executive = "executive"
+
+
+class _JobSlot(BaseModel):
+    """Dynamic assignment of a job role within a company."""
+    instance_id: int = get_instance_id()
+    role: JobRole
+    person_id: Optional[int] = None
+    team_id: Optional[str] = None
+    department_id: Optional[str] = None
+    segment_id: Optional[str] = None
+
+
+class _Team(BaseModel):
+    id: str
+    name: str
+    unit_ids: List[str] = Field(default_factory=list)
+    lead_slot: _JobSlot = Field(default_factory=lambda: _JobSlot(role=JobRole.lead))
+    operator_slots: List[_JobSlot] = Field(default_factory=list)
+
+
+class _Department(BaseModel):
+    id: str
+    name: str
+    manager_slots: List[_JobSlot] = Field(default_factory=list)
+    teams: Dict[str, _Team] = Field(default_factory=dict)
+
+
+class _BusinessSegment(BaseModel):
+    id: str
+    name: str
+    director_slots: List[_JobSlot] = Field(default_factory=list)
+    departments: Dict[str, _Department] = Field(default_factory=dict)
+    inventory_for_sale: Dict[str, Decimal] = Field(default_factory=dict)
 
 class EducationCategory(BaseModel):
     id: str
@@ -558,6 +602,8 @@ class _PersonInstance(_FinancialEntityInstance):
     memory: PersonMemory = Field(default_factory=PersonMemory)
     education: Optional[EducationCategory]
 
+    job_slot_id: Optional[int] = None
+
     domain: Optional[str] = None
     
     employer_id: Optional[int]
@@ -580,5 +626,7 @@ class _WorldState(BaseModel):
     registry: Dict[str, dict] = Field(default_factory=dict)
     emails: List[EmailMessage] = Field(default_factory=list)
     internet: Dict[str, str] = Field(default_factory=dict)
+
+    jobs: Dict[int, _JobSlot] = Field(default_factory=dict)
 
     # ── Helper methods -----------------------------------------------------

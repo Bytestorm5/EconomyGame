@@ -35,17 +35,19 @@ class PersonAgent(BaseAgent):
     def act(self, person: G._PersonInstance, world: G._WorldState, tick: int) -> str:
         traits = []
         for tid in person.personality_traits:
-            trait = world.registry.get("PersonalityTrait", {}).get(tid)
+            trait = world.registry.get("_PersonalityTrait", {}).get(tid)
             if trait:
                 traits.append(f"- {trait.id}: {trait.description}")
-        system = "You control a person in a business simulation. Use the tools to act."
+        slot = world.jobs.get(person.job_slot_id) if person.job_slot_id else None
+        role = slot.role.value if slot else "unemployed"
+        system = f"You control a {role} in a business simulation. Use the tools to act."
         short_mem = "\n".join(person.memory.short_term)
         long_mem = person.memory.long_term.get("general", "")
         tools = Toolset(world, lambda: tick)
         if isinstance(self.llm, DummyLLM):
             return "noop"
         agent = initialize_agent(tools.as_tools(), self.llm, agent=AgentType.OPENAI_FUNCTIONS, verbose=False)
-        prompt = f"Traits:\n" + "\n".join(traits) + f"\nRecent:\n{short_mem}\nLong:\n{long_mem}"
+        prompt = f"Role:{role}\nTraits:\n" + "\n".join(traits) + f"\nRecent:\n{short_mem}\nLong:\n{long_mem}"
         return agent.run(prompt)
 
 
