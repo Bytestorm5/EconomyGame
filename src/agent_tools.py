@@ -85,6 +85,7 @@ class JobBoardInput(BaseModel):
     company_id: Optional[int] = None
     department_id: Optional[int] = None
     role: Optional[str] = None
+    categories: Optional[List[str]] = None
 
 
 class MemoryQueryInput(BaseModel):
@@ -98,7 +99,7 @@ class StaffActionInput(BaseModel):
     action: StaffAction
     target_person_id: Optional[int] = None
     target_role: Optional[str] = None
-    target_team_id: Optional[str] = None
+    target_slot_id: Optional[int] = None
     salary: Optional[int] = None
     notes: str = ""
 
@@ -193,14 +194,37 @@ class Toolset:
     @tool("job_board")
     def job_board(self, data: JobBoardInput) -> str:
         """List open job slots."""
-        jobs = []
+        slots = []
         for slot in self.world.jobs.values():
             if slot.person_id is not None:
                 continue
-            if data.company_id and slot.segment_id:
-                pass
-            jobs.append(f"{slot.instance_id}:{slot.role.value}")
-        return "\n".join(jobs)
+            if data.role and slot.role.value != data.role:
+                continue
+            slots.append(slot)
+
+        def distance(slot: G._JobSlot) -> int:
+            if not data.categories:
+                return 999
+            best = 999
+            for req_id in slot.required_education:
+                req = self.world.registry.get("EducationCategory", {}).get(req_id)
+                if not req:
+                    continue
+                for cat_id in data.categories:
+                    cat = self.world.registry.get("EducationCategory", {}).get(cat_id)
+                    if not cat:
+                        continue
+                    if cat == req:
+                        return 0
+                    d = req.degrees_of_separation(cat) or cat.degrees_of_separation(req)
+                    if d is not None and d < best:
+                        best = d
+            return best
+
+        if data.categories:
+            slots.sort(key=distance)
+
+        return "\n".join(f"{s.instance_id}:{s.role.value}" for s in slots)
 
     @tool("memory_query")
     def memory_query(self, data: MemoryQueryInput) -> str:
@@ -223,26 +247,56 @@ class Toolset:
             return "invalid_actor"
         role = self._role_of(actor)
         if data.action == StaffAction.APPLY:
-            slot = self.world.jobs.get(int(data.target_team_id or 0))
-            if slot and slot.person_id is None:
-                slot.person_id = actor.instance_id
-                actor.job_slot_id = slot.instance_id
-                actor.memory.add_short(f"Applied and placed in slot {slot.instance_id}")
-                return f"apply:{slot.instance_id}"
-            return "invalid_slot"
+            slot = self.world.jobs.get(int(data.target_slot_id or 0))
+            if not slot or slot.person_id is not None:
+                return "invalid_slot"
+            if actor.instance_id in slot.applicant_ids:
+                return "already_applied"
+            slot.applicant_ids.append(actor.instance_id)
+            # notify department managers
+            mgrs: List[int] = []
+            for comp in self.world.companies.values():
+                for seg in comp.segments.values():
+                    dept = seg.departments.get(slot.department_id or "")
+                    if not dept:
+                        continue
+                    for mslot in dept.manager_slots:
+                        if mslot.person_id:
+                            mgrs.append(mslot.person_id)
+                    break
+            if mgrs:
+                self.send_email(
+                    "person",
+                    actor.instance_id,
+                    to_people=mgrs,
+                    subject="Job Application",
+                    body=f"Applicant {actor.instance_id} for slot {slot.instance_id}",
+                )
+            actor.memory.add_short(f"Applied for slot {slot.instance_id}")
+            return "applied"
         if data.action == StaffAction.HIRE:
             if role not in [G.JobRole.manager, G.JobRole.director, G.JobRole.executive]:
                 return "forbidden"
             person = self.world.population.get(data.target_person_id or -1)
             if not person:
                 return "no_person"
-            slot = self.world.jobs.get(int(data.target_team_id or 0))
+            slot = self.world.jobs.get(int(data.target_slot_id or 0))
             if not slot or slot.person_id is not None:
                 return "invalid_slot"
+            if person.instance_id not in slot.applicant_ids:
+                return "not_applied"
             slot.person_id = person.instance_id
+            slot.applicant_ids.remove(person.instance_id)
             person.job_slot_id = slot.instance_id
             person.employer_id = actor.employer_id
             actor.memory.add_short(f"Hired {person.instance_id} into slot {slot.instance_id}")
+            self.send_email(
+                "person",
+                actor.instance_id,
+                to_people=[person.instance_id],
+                subject="Job Offer",
+                body=f"You have been hired into slot {slot.instance_id}",
+            )
             return f"hire:{slot.instance_id}"
         if data.action == StaffAction.FIRE:
             if role not in [G.JobRole.manager, G.JobRole.director, G.JobRole.executive]:
@@ -275,16 +329,18 @@ class Toolset:
             person = self.world.population.get(data.target_person_id or -1)
             if not person or person.job_slot_id is None:
                 return "no_person"
-            new_slot = self.world.jobs.get(int(data.target_team_id or 0))
+            new_slot = self.world.jobs.get(int(data.target_slot_id or 0))
             if not new_slot or new_slot.person_id is not None:
                 return "invalid_slot"
-            old_slot = self.world.jobs.get(person.job_slot_id)
-            if old_slot:
-                old_slot.person_id = None
-            new_slot.person_id = person.instance_id
-            person.job_slot_id = new_slot.instance_id
-            actor.memory.add_short(f"Transferred {person.instance_id} to slot {new_slot.instance_id}")
-            return "transfer"
+            self.send_email(
+                "person",
+                actor.instance_id,
+                to_people=[person.instance_id],
+                subject="Transfer Request",
+                body=f"Transfer to slot {new_slot.instance_id}?", 
+            )
+            actor.memory.add_short(f"Requested transfer of {person.instance_id} to slot {new_slot.instance_id}")
+            return "transfer_requested"
         actor.memory.add_short(f"Staff action {data.action}")
         return "noop"
 
@@ -315,6 +371,69 @@ class Toolset:
             dept.teams[team_id] = G._Team(id=team_id, name=data.new_name or team_id)
             actor.memory.add_short(f"Created team {team_id}")
             return f"create_team:{team_id}"
+        if data.action == StructureAction.MERGE_TEAMS:
+            dept = find_department(data.parent_id) if data.parent_id is not None else None
+            if not dept or len(data.subject_ids) < 2:
+                return "no_department"
+            t1 = dept.teams.get(str(data.subject_ids[0]))
+            t2 = dept.teams.get(str(data.subject_ids[1]))
+            if not t1 or not t2:
+                return "no_team"
+            t1.operator_slots.extend(t2.operator_slots)
+            if not t1.lead_slot.person_id:
+                t1.lead_slot = t2.lead_slot
+            del dept.teams[str(data.subject_ids[1])]
+            actor.memory.add_short("Merged teams")
+            return "merge_teams"
+        if data.action == StructureAction.SPLIT_TEAM:
+            dept = find_department(data.parent_id) if data.parent_id is not None else None
+            if not dept or len(data.subject_ids) < 1:
+                return "no_department"
+            old = dept.teams.get(str(data.subject_ids[0]))
+            if not old:
+                return "no_team"
+            new_id = f"team{len(dept.teams)+1}"
+            new_team = G._Team(id=new_id, name=data.new_name or new_id)
+            half = len(old.operator_slots) // 2
+            new_team.operator_slots = old.operator_slots[half:]
+            old.operator_slots = old.operator_slots[:half]
+            dept.teams[new_id] = new_team
+            actor.memory.add_short("Split team")
+            return "split_team"
+        if data.action == StructureAction.CREATE_DEPARTMENT:
+            for seg in company.segments.values():
+                if seg.id == str(data.parent_id):
+                    dep_id = f"dept{len(seg.departments)+1}"
+                    seg.departments[dep_id] = G._Department(id=dep_id, name=data.new_name or dep_id)
+                    actor.memory.add_short("Created department")
+                    return "create_department"
+            return "no_segment"
+        if data.action == StructureAction.MERGE_DEPARTMENTS:
+            for seg in company.segments.values():
+                d1 = seg.departments.get(str(data.subject_ids[0]))
+                d2 = seg.departments.get(str(data.subject_ids[1]))
+                if d1 and d2:
+                    d1.teams.update(d2.teams)
+                    d1.manager_slots.extend(d2.manager_slots)
+                    del seg.departments[str(data.subject_ids[1])]
+                    actor.memory.add_short("Merged departments")
+                    return "merge_departments"
+            return "no_department"
+        if data.action == StructureAction.SPLIT_DEPARTMENT:
+            for seg in company.segments.values():
+                dep = seg.departments.get(str(data.subject_ids[0]))
+                if dep:
+                    new_id = f"dept{len(seg.departments)+1}"
+                    new_dep = G._Department(id=new_id, name=data.new_name or new_id)
+                    half = len(dep.teams) // 2
+                    for i, (tid, team) in enumerate(list(dep.teams.items())):
+                        if i >= half:
+                            new_dep.teams[tid] = team
+                            del dep.teams[tid]
+                    seg.departments[new_id] = new_dep
+                    actor.memory.add_short("Split department")
+                    return "split_department"
+            return "no_department"
         actor.memory.add_short(f"structure:{data.action}")
         return "ok"
 
@@ -340,6 +459,39 @@ class Toolset:
                     actor.memory.add_short(f"Added machine {data.machine_type} to unit {data.unit_id}")
                     return "add_machine"
             return "no_unit"
+        if data.action == AssetAction.REMOVE_MACHINE:
+            if data.unit_id is None:
+                return "missing_params"
+            for b in self.world.buildings.values():
+                unit = b.units.get(data.unit_id)
+                if unit and unit.machines:
+                    unit.machines.pop()
+                    actor.memory.add_short("Removed machine")
+                    return "remove_machine"
+            return "no_unit"
+        if data.action == AssetAction.ALLOCATE_UNIT:
+            if data.unit_id is None:
+                return "missing_params"
+            for b in self.world.buildings.values():
+                unit = b.units.get(data.unit_id)
+                if unit:
+                    unit.owner_company_id = str(actor.employer_id)
+                    actor.memory.add_short("Allocated unit")
+                    return "allocate_unit"
+            return "no_unit"
+        if data.action == AssetAction.REVOKE_UNIT:
+            if data.unit_id is None:
+                return "missing_params"
+            for b in self.world.buildings.values():
+                unit = b.units.get(data.unit_id)
+                if unit:
+                    unit.owner_company_id = ""
+                    actor.memory.add_short("Revoked unit")
+                    return "revoke_unit"
+            return "no_unit"
+        if data.action == AssetAction.SET_BUDGET:
+            actor.memory.add_short(f"Set budget to {data.cost}")
+            return "set_budget"
         actor.memory.add_short(f"asset:{data.action}")
         return "ok"
 
