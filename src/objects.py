@@ -536,6 +536,7 @@ class _JobSlot(BaseModel):
     """Dynamic assignment of a job role within a company."""
     instance_id: int = get_instance_id()
     role: JobRole
+    required_education: List[str] = Field(default_factory=list)
     person_id: Optional[int] = None
     team_id: Optional[str] = None
     department_id: Optional[str] = None
