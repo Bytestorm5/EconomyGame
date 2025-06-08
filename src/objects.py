@@ -286,6 +286,7 @@ class _UnitInstance(BaseModel):
 
     instance_id: int = get_instance_id()
     owner_company_id: str
+    access_team_ids: List[str] = Field(default_factory=list)
     floor_space: PositiveInt = Field(..., description="Maximum usable space in tiles")
     machines: List[_MachineInstance] = Field(default_factory=list)
 
@@ -548,6 +549,7 @@ class _Team(BaseModel):
     id: str
     name: str
     unit_ids: List[str] = Field(default_factory=list)
+    budget: Decimal = Decimal(0)
     lead_slot: _JobSlot = Field(default_factory=lambda: _JobSlot(role=JobRole.lead))
     operator_slots: List[_JobSlot] = Field(default_factory=list)
 
@@ -557,6 +559,7 @@ class _Department(BaseModel):
     name: str
     manager_slots: List[_JobSlot] = Field(default_factory=list)
     teams: Dict[str, _Team] = Field(default_factory=dict)
+    budget: Decimal = Decimal(0)
 
 
 class _BusinessSegment(BaseModel):
@@ -565,6 +568,7 @@ class _BusinessSegment(BaseModel):
     director_slots: List[_JobSlot] = Field(default_factory=list)
     departments: Dict[str, _Department] = Field(default_factory=dict)
     inventory_for_sale: Dict[str, Decimal] = Field(default_factory=dict)
+    budget: Decimal = Decimal(0)
 
 class EducationCategory(BaseModel):
     id: str

@@ -1,5 +1,6 @@
 from __future__ import annotations
 from typing import List, Optional, Dict
+from decimal import Decimal
 from enum import Enum
 from pydantic import BaseModel, Field
 from langchain.tools import tool
@@ -123,6 +124,7 @@ class AssetActionInput(BaseModel):
     cost: Optional[int] = None
     team_id: Optional[str] = None
     department_id: Optional[str] = None
+    segment_id: Optional[str] = None
     notes: str = ""
 
 
@@ -362,7 +364,7 @@ class Toolset:
             return None
 
         if data.action == StructureAction.CREATE_TEAM:
-            if role not in [G.JobRole.manager, G.JobRole.director, G.JobRole.executive]:
+            if role != G.JobRole.manager:
                 return "forbidden"
             dept = find_department(data.parent_id) if data.parent_id is not None else None
             if not dept:
@@ -372,6 +374,8 @@ class Toolset:
             actor.memory.add_short(f"Created team {team_id}")
             return f"create_team:{team_id}"
         if data.action == StructureAction.MERGE_TEAMS:
+            if role != G.JobRole.manager:
+                return "forbidden"
             dept = find_department(data.parent_id) if data.parent_id is not None else None
             if not dept or len(data.subject_ids) < 2:
                 return "no_department"
@@ -386,6 +390,8 @@ class Toolset:
             actor.memory.add_short("Merged teams")
             return "merge_teams"
         if data.action == StructureAction.SPLIT_TEAM:
+            if role != G.JobRole.manager:
+                return "forbidden"
             dept = find_department(data.parent_id) if data.parent_id is not None else None
             if not dept or len(data.subject_ids) < 1:
                 return "no_department"
@@ -401,6 +407,8 @@ class Toolset:
             actor.memory.add_short("Split team")
             return "split_team"
         if data.action == StructureAction.CREATE_DEPARTMENT:
+            if role not in [G.JobRole.director, G.JobRole.executive]:
+                return "forbidden"
             for seg in company.segments.values():
                 if seg.id == str(data.parent_id):
                     dep_id = f"dept{len(seg.departments)+1}"
@@ -409,6 +417,8 @@ class Toolset:
                     return "create_department"
             return "no_segment"
         if data.action == StructureAction.MERGE_DEPARTMENTS:
+            if role not in [G.JobRole.director, G.JobRole.executive]:
+                return "forbidden"
             for seg in company.segments.values():
                 d1 = seg.departments.get(str(data.subject_ids[0]))
                 d2 = seg.departments.get(str(data.subject_ids[1]))
@@ -420,6 +430,8 @@ class Toolset:
                     return "merge_departments"
             return "no_department"
         if data.action == StructureAction.SPLIT_DEPARTMENT:
+            if role not in [G.JobRole.director, G.JobRole.executive]:
+                return "forbidden"
             for seg in company.segments.values():
                 dep = seg.departments.get(str(data.subject_ids[0]))
                 if dep:
@@ -452,11 +464,21 @@ class Toolset:
             machine_def = self.world.registry.get("MachineDefinition", {}).get(data.machine_type)
             if not machine_def:
                 return "bad_machine"
+            company = self.world.companies.get(actor.employer_id or -1)
+            if not company:
+                return "no_company"
+            cost = data.cost or 100
+            funds = company.resources.get("money", Decimal(0))
+            if funds < Decimal(cost):
+                return "no_funds"
             for b in self.world.buildings.values():
                 unit = b.units.get(data.unit_id)
                 if unit:
+                    company.resources["money"] = funds - Decimal(cost)
                     unit.add_machine(machine_def, active=False)
-                    actor.memory.add_short(f"Added machine {data.machine_type} to unit {data.unit_id}")
+                    actor.memory.add_short(
+                        f"Purchased {data.machine_type} for unit {data.unit_id} at {cost}"
+                    )
                     return "add_machine"
             return "no_unit"
         if data.action == AssetAction.REMOVE_MACHINE:
@@ -476,6 +498,8 @@ class Toolset:
                 unit = b.units.get(data.unit_id)
                 if unit:
                     unit.owner_company_id = str(actor.employer_id)
+                    if data.team_id and data.team_id not in unit.access_team_ids:
+                        unit.access_team_ids.append(data.team_id)
                     actor.memory.add_short("Allocated unit")
                     return "allocate_unit"
             return "no_unit"
@@ -485,13 +509,40 @@ class Toolset:
             for b in self.world.buildings.values():
                 unit = b.units.get(data.unit_id)
                 if unit:
-                    unit.owner_company_id = ""
+                    if data.team_id and data.team_id in unit.access_team_ids:
+                        unit.access_team_ids.remove(data.team_id)
+                    else:
+                        unit.owner_company_id = ""
                     actor.memory.add_short("Revoked unit")
                     return "revoke_unit"
             return "no_unit"
         if data.action == AssetAction.SET_BUDGET:
-            actor.memory.add_short(f"Set budget to {data.cost}")
-            return "set_budget"
+            company = self.world.companies.get(actor.employer_id or -1)
+            if not company:
+                return "no_company"
+            if data.team_id:
+                for seg in company.segments.values():
+                    for dept in seg.departments.values():
+                        team = dept.teams.get(str(data.team_id))
+                        if team:
+                            team.budget = Decimal(data.cost or 0)
+                            actor.memory.add_short(f"Set team {data.team_id} budget to {data.cost}")
+                            return "set_budget"
+            if data.department_id:
+                for seg in company.segments.values():
+                    dept = seg.departments.get(str(data.department_id))
+                    if dept:
+                        dept.budget = Decimal(data.cost or 0)
+                        actor.memory.add_short(f"Set department {data.department_id} budget to {data.cost}")
+                        return "set_budget"
+            if data.segment_id:
+                seg = company.segments.get(str(data.segment_id))
+                if seg:
+                    seg.budget = Decimal(data.cost or 0)
+                    actor.memory.add_short(f"Set segment {data.segment_id} budget to {data.cost}")
+                    return "set_budget"
+            actor.memory.add_short("budget_failed")
+            return "no_target"
         actor.memory.add_short(f"asset:{data.action}")
         return "ok"
 
