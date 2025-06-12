@@ -145,9 +145,12 @@ class Market:
         res_def = ResourceDefs.get(self.resource_id)
         if not res_def or not getattr(res_def, 'is_physical', False):
             return Decimal("0")
-        # Gather parked vehicles belonging to company
-        vehicles = [v for v in self.world.vehicles.values()
-                    if v.owner_company_id == company_id and getattr(v, 'is_parked', False)]
+        # Gather idle/parked vehicles belonging to company
+        vehicles = [
+            v
+            for v in self.world.vehicles.values()
+            if v.owner_company_id == company_id and v.status in {"idle", "parked"}
+        ]
         if not vehicles:
             return Decimal("0")
         # Pre-calculate fuel price
@@ -164,7 +167,7 @@ class Market:
         # Collect vehicles with (capacity, distance)
         vehicle_info: List[Tuple[G.Vehicle, int, Decimal]] = []
         for v in vehicles:
-            cap = v.cargo_inventory_size
+            cap = int(v.vehicle_type.cargo_inventory_size)
             vx, vy = v.position
             dist = Decimal(abs(sbx - vx) + abs(sby - vy))
             vehicle_info.append((v, cap, dist))
@@ -277,6 +280,77 @@ class MachineBehavior(Behavior):
                             # if full put failed, fill partially
                             m.inventory.put(out_stack, fill=True)
 
+class VehicleBehavior(Behavior):
+    """Moves vehicles, consumes fuel, and handles loading/unloading."""
+
+    def _find_building_at(self, world: G._WorldState, pos: Tuple[int, int]) -> Optional[G._BuildingInstance]:
+        parcel = next((p for p in world.land.values() if p.x == pos[0] and p.y == pos[1]), None)
+        if parcel and parcel.building_id is not None:
+            return world.buildings.get(int(parcel.building_id))
+        return None
+
+    def _transfer_all(self, src: G._Inventory, dst: G._Inventory) -> bool:
+        moved = False
+        for stack in list(src.stacks):
+            src.stacks.remove(stack)
+            remainder = dst.put(stack, fill=True)
+            if remainder and remainder.amount > 0:
+                src.stacks.append(remainder)
+            moved = True
+        return moved
+
+    def tick(self, world: G._WorldState, markets: Dict[str, Market], tick: int):
+        for v in world.vehicles.values():
+            if v.status == "moving" and v.destination:
+                speed = int(v.current_speed or v.vehicle_type.max_speed)
+                x, y = v.position
+                dx, dy = v.destination
+                for _ in range(speed):
+                    if (x, y) == (dx, dy):
+                        break
+                    if x < dx:
+                        x += 1
+                    elif x > dx:
+                        x -= 1
+                    elif y < dy:
+                        y += 1
+                    elif y > dy:
+                        y -= 1
+                    v.fuel_stored -= v.vehicle_type.fuel_consumption
+                    if v.fuel_stored <= 0:
+                        v.fuel_stored = Decimal(0)
+                        v.current_speed = Decimal(0)
+                        v.destination = None
+                        v.status = "idle"
+                        break
+                v.position = (x, y)
+                if v.destination and (x, y) == v.destination:
+                    v.destination = None
+                    v.status = "idle"
+
+            elif v.status in {"loading", "unloading"}:
+                bld = self._find_building_at(world, v.position)
+                if not bld:
+                    v.status = "idle"
+                    continue
+                container = None
+                for unit in bld.units.values():
+                    for m in unit.machines:
+                        if m.machine.is_container:
+                            container = m.inventory
+                            break
+                    if container:
+                        break
+                if not container:
+                    v.status = "idle"
+                    continue
+                if v.status == "loading":
+                    moved = self._transfer_all(container, v.inventory)
+                else:
+                    moved = self._transfer_all(v.inventory, container)
+                if not moved:
+                    v.status = "idle"
+
 class BehaviorManager:
     def __init__(self, world: G._WorldState, markets: Dict[str, Market]):
         self.world = world
@@ -306,6 +380,7 @@ def main(ticks: int = 1) -> None:
     bm.register(MarketBehavior())
     bm.register(CompanyBehavior())
     bm.register(PersonBehavior())
+    bm.register(VehicleBehavior())
 
     for _ in range(ticks):
         bm.tick()
