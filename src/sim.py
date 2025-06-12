@@ -100,6 +100,8 @@ class Market:
         self.preset: Optional[G.ResourceMarketPreset] = PresetDefs.get(res_def.market_behavior)
         self.order_book = OrderBook()
         self.last_update: int = 0
+        # price at start of current tick (used for cross-price effects)
+        self.prev_price: Decimal = self.price
         # Will be set externally to access other markets (e.g., fuel)
         self.markets: Dict[str, Market] = {}
 
@@ -115,18 +117,30 @@ class Market:
         return supply, demand
 
     def update_prices(self, tick: int) -> None:
+        """Update market price based on supply/demand and cross elasticities."""
         if not self.preset or tick - self.last_update < self.preset.price_stickiness:
+            self.prev_price = self.price
             return
         s, d = self.compute_supply_demand(tick)
         old_price = self.price
         if s > 0:
             delta = (d - s) / s
+            # factor in price changes of related resources
+            for rid, ce in self.preset.cross_elasticities.items():
+                mkt = self.markets.get(rid)
+                if not mkt:
+                    continue
+                prev = getattr(mkt, "prev_price", mkt.price)
+                if prev:
+                    delta += ce * ((mkt.price - prev) / prev)
             change = (old_price * (delta ** (Decimal(1) / self.preset.elasticity))) - old_price
             if abs(change) < self.preset.menu_cost:
+                self.prev_price = old_price
                 return
             new_price = old_price + change * self.adjustment_rate
             self.price = max(Decimal("0.01"), new_price)
             self.last_update = tick
+        self.prev_price = old_price
 
     def get_available_supply(self, actor_type: str) -> Decimal:
         total = Decimal(0)
@@ -212,8 +226,11 @@ class Behavior:
 
 class MarketBehavior(Behavior):
     def tick(self, world: G._WorldState, markets: Dict[str, Market], tick: int):
+        # first update prices for all markets
         for market in markets.values():
             market.update_prices(tick)
+        # perform order matching after prices settle
+        for market in markets.values():
             trades = market.order_book.match(tick)
             for buy, sell, price, qty in trades:
                 if buy.actor_type == 'company':
@@ -226,6 +243,9 @@ class MarketBehavior(Behavior):
                     if comp:
                         comp.resources[sell.resource_id] = comp.resources.get(sell.resource_id, Decimal(0)) - qty
                         comp.resources['money'] = comp.resources.get('money', Decimal(0)) + price * qty
+        # mark new prices as previous for next tick
+        for market in markets.values():
+            market.prev_price = market.price
 
 class CompanyBehavior(Behavior):
     def __init__(self) -> None:
