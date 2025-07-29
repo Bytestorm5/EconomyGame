@@ -116,7 +116,11 @@ class Market:
         return Decimal(supply), Decimal(demand)
 
     def update_prices(self, tick: int, rng: random.Random) -> None:
-        """Update market price based on supply/demand and cross elasticities."""
+        """Update ``self.price`` based on supply/demand and cross elasticities.
+
+        The ``rng`` parameter introduces deterministic noise so that running the
+        simulation with the same seed reproduces identical price paths.
+        """
         if not self.preset or tick - self.last_update < self.preset.price_stickiness:
             self.prev_price = self.price
             return
@@ -407,6 +411,8 @@ class VehicleBehavior(Behavior):
                     v.status = "idle"
 
 class BehaviorManager:
+    """Coordinates all Behaviors and maintains a deterministic random source."""
+
     def __init__(self, world: G._WorldState, markets: Dict[str, Market], seed: int = 0):
         self.world = world
         self.markets = markets
@@ -427,6 +433,8 @@ class BehaviorManager:
 # -----------------------------------
 
 def main(ticks: int = 1, seed: int = 0) -> None:
+    """Run the simulation for a number of ticks using the given RNG seed."""
+
     world = load_world()
     markets = {res_id: Market(world, res_id) for res_id in ResourceDefs}
     for m in markets.values():
@@ -443,4 +451,11 @@ def main(ticks: int = 1, seed: int = 0) -> None:
     save_world(world)
 
 if __name__ == "__main__":
-    main(ticks=10)
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Run economic simulation")
+    parser.add_argument("--ticks", type=int, default=10, help="Number of ticks to run")
+    parser.add_argument("--seed", type=int, default=0, help="RNG seed for deterministic runs")
+    args = parser.parse_args()
+
+    main(ticks=args.ticks, seed=args.seed)

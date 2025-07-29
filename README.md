@@ -7,8 +7,17 @@ runs when a seed is provided.
 
 ## Running
 
+The simulation can be run directly with Python. Use `--ticks` to specify the
+number of ticks and `--seed` for deterministic runs:
+
+```bash
+python src/sim.py --ticks 10 --seed 42
 ```
-python src/sim.py
+
+You can also run the small demo which prints price movements for a toy market:
+
+```bash
+python scripts/demo.py
 ```
 
 ## Testing
@@ -18,5 +27,6 @@ Run unit tests with `pytest`:
 ```
 pytest
 ```
+
 
 
