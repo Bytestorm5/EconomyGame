@@ -91,7 +91,7 @@ def register_content(folders: List[Path]) -> Dict[str, Union[List[BaseModel], Di
                         key = getattr(instance, 'id')
                         registry[model_name][key] = instance
                     else:
-                        registry[model_name].append(instance)
+                        registry[model_name].append(instance) # type: ignore
                 except Exception as e:
                     print(f"Error parsing {json_file}: {e}")
 

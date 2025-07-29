@@ -9,17 +9,15 @@ from pydantic import BaseModel, Field
 from register import register_content, MOD_PATHS, LOCAL_CONTENT
 import objects as G
 from objects import get_instance_id
-from llm_agents import PersonAgent, CompanyAgent
-
 # Constants
 WORLD_STATE_PATH = Path("world_state.json")
 ALL_SOURCES = [LOCAL_CONTENT] + MOD_PATHS
 
 # Load registry
 REGISTRY = register_content(ALL_SOURCES)
-ResourceDefs: Dict[str, G.Resource] = REGISTRY.get("Resource", {})
-PresetDefs: Dict[str, G.ResourceMarketPreset] = REGISTRY.get("ResourceMarketPreset", {})
-ConvDefs: Dict[str, G.ResourceConversion] = REGISTRY.get("ResourceConversion", {})
+ResourceDefs: Dict[str, G.Resource] = REGISTRY.get("Resource", {}) # type: ignore
+PresetDefs: Dict[str, G.ResourceMarketPreset] = REGISTRY.get("ResourceMarketPreset", {}) # type: ignore
+ConvDefs: Dict[str, G.ResourceConversion] = REGISTRY.get("ResourceConversion", {}) # type: ignore
 
 # -----------------------------------
 # Persistence
@@ -29,10 +27,10 @@ def load_world() -> G._WorldState:
     if WORLD_STATE_PATH.exists():
         raw = WORLD_STATE_PATH.read_text(encoding="utf-8")
         world = G._WorldState.model_validate_json(raw)
-        world.registry = REGISTRY
+        world.registry = REGISTRY # type: ignore
         return world
     w = G._WorldState()
-    w.registry = REGISTRY
+    w.registry = REGISTRY # type: ignore
     return w
 
 
@@ -114,7 +112,7 @@ class Market:
             o.quantity for o in self.order_book.orders
             if o.timestamp == tick and o.side == "buy"
         )
-        return supply, demand
+        return Decimal(supply), Decimal(demand)
 
     def update_prices(self, tick: int) -> None:
         """Update market price based on supply/demand and cross elasticities."""
@@ -179,7 +177,7 @@ class Market:
             return Decimal("0")
         sbx, sby = parcels[0].x, parcels[0].y
         # Collect vehicles with (capacity, distance)
-        vehicle_info: List[Tuple[G.Vehicle, int, Decimal]] = []
+        vehicle_info: List[Tuple[G._VehicleInstance, int, Decimal]] = []
         for v in vehicles:
             cap = int(v.vehicle_type.cargo_inventory_size)
             vx, vy = v.position
@@ -249,21 +247,17 @@ class MarketBehavior(Behavior):
 
 class CompanyBehavior(Behavior):
     def __init__(self) -> None:
-        self.agent = CompanyAgent()
+        ...
 
     def tick(self, world: G._WorldState, markets: Dict[str, Market], tick: int):
-        for comp in world.companies.values():
-            action = self.agent.act(comp, world, tick)
-            comp.resources.setdefault("log", []).append(action)
+        ...
 
 class PersonBehavior(Behavior):
     def __init__(self) -> None:
-        self.agent = PersonAgent()
+        ...
 
     def tick(self, world: G._WorldState, markets: Dict[str, Market], tick: int):
-        for person in world.population.values():
-            action = self.agent.act(person, world, tick)
-            person.memory.add_short(f"tick {tick}: {action}")
+        ...
 
 class MachineBehavior(Behavior):
     """
@@ -273,9 +267,11 @@ class MachineBehavior(Behavior):
         for building in world.buildings.values():
             for unit in building.units.values():
                 for m in unit.machines:
-                    if not m.is_active:
+                    if not m.is_active or m.recipe is None:
                         continue
                     conv = ConvDefs.get(m.recipe)
+                    if conv is None:
+                        continue
                     # determine cycle time
                     cycle = m.machine.possible_recipes.get(m.recipe) or conv.default_time_taken
                     # only run at multiples of cycle
@@ -291,7 +287,7 @@ class MachineBehavior(Behavior):
                             break
                     if not can_run:
                         continue
-                    m.wait_for_tick = tick + cycle
+                    m.wait_for_tick = tick + int(cycle)
                     # produce outputs
                     for res_id, amt in conv.output_resources.items():
                         out_stack = G._ResourceStack(amount=int(amt), cost=0.0, resource_id=res_id)

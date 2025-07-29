@@ -247,13 +247,13 @@ class _MachineInstance(BaseModel):
 
     # We only define where conveyors are going- the machine's inventory will be
     # updated with inbound conveyor items without this instance having to to anything.
-    conveyors_out: List[str]
+    conveyors_out: List[str] = []
     # id of the recipe that this machine is set to
-    recipe: str
+    recipe: str | None = None
     # the tick at which the currently-running recipie will be completed
     wait_for_tick: int = 0
     
-    inventory: _Inventory
+    inventory: _Inventory = None # type: ignore
 
     @model_validator(mode="before")
     def init_inventory(cls, values):
@@ -354,7 +354,7 @@ class _BuildingInstance(BaseModel):
     definition: BuildingDefinition
     owner_company_id: str
     # units keyed by their IDs
-    units: Dict[str, _UnitInstance] = Field(default_factory=dict)
+    units: Dict[int, _UnitInstance] = Field(default_factory=dict)
     
     loading_bay_occupants: List[str]
     parking_occupants: List[str]
@@ -447,8 +447,8 @@ class _VehicleInstance(BaseModel):
     @model_validator(mode="before")
     def init_inventory(cls, values):
         vehicle_def: VehicleDefinition = values.get('vehicle_type')
-        cap = vehicle_def.cargo_inventory_size or 0
-        values['inventory'] = _Inventory(capacity=cap)
+        cap: Decimal = vehicle_def.cargo_inventory_size or Decimal(0)
+        values['inventory'] = _Inventory(capacity=int(cap))
         return values
 
 # ────────────────────────────────────────────────────────────────────────────
