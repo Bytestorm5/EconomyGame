@@ -3,6 +3,7 @@ from pathlib import Path
 from decimal import Decimal
 from typing import Dict, Optional, List, Tuple, Literal
 from math import ceil
+import random
 
 from pydantic import BaseModel, Field
 
@@ -114,7 +115,7 @@ class Market:
         )
         return Decimal(supply), Decimal(demand)
 
-    def update_prices(self, tick: int) -> None:
+    def update_prices(self, tick: int, rng: random.Random) -> None:
         """Update market price based on supply/demand and cross elasticities."""
         if not self.preset or tick - self.last_update < self.preset.price_stickiness:
             self.prev_price = self.price
@@ -131,6 +132,8 @@ class Market:
                 prev = getattr(mkt, "prev_price", mkt.price)
                 if prev:
                     delta += ce * ((mkt.price - prev) / prev)
+            # random noise for semi-efficient markets
+            delta += Decimal(str(rng.uniform(-0.05, 0.05)))
             change = (old_price * (delta ** (Decimal(1) / self.preset.elasticity))) - old_price
             if abs(change) < self.preset.menu_cost:
                 self.prev_price = old_price
@@ -219,14 +222,26 @@ class Market:
 # -----------------------------------
 
 class Behavior:
-    def tick(self, world: G._WorldState, markets: Dict[str, Market], tick: int):
+    def tick(
+        self,
+        world: G._WorldState,
+        markets: Dict[str, Market],
+        tick: int,
+        rng: random.Random,
+    ) -> None:
         raise NotImplementedError
 
 class MarketBehavior(Behavior):
-    def tick(self, world: G._WorldState, markets: Dict[str, Market], tick: int):
+    def tick(
+        self,
+        world: G._WorldState,
+        markets: Dict[str, Market],
+        tick: int,
+        rng: random.Random,
+    ) -> None:
         # first update prices for all markets
         for market in markets.values():
-            market.update_prices(tick)
+            market.update_prices(tick, rng)
         # perform order matching after prices settle
         for market in markets.values():
             trades = market.order_book.match(tick)
@@ -249,21 +264,39 @@ class CompanyBehavior(Behavior):
     def __init__(self) -> None:
         ...
 
-    def tick(self, world: G._WorldState, markets: Dict[str, Market], tick: int):
+    def tick(
+        self,
+        world: G._WorldState,
+        markets: Dict[str, Market],
+        tick: int,
+        rng: random.Random,
+    ) -> None:
         ...
 
 class PersonBehavior(Behavior):
     def __init__(self) -> None:
         ...
 
-    def tick(self, world: G._WorldState, markets: Dict[str, Market], tick: int):
+    def tick(
+        self,
+        world: G._WorldState,
+        markets: Dict[str, Market],
+        tick: int,
+        rng: random.Random,
+    ) -> None:
         ...
 
 class MachineBehavior(Behavior):
     """
     Handles production: consumes inputs and adds outputs to each active machine's inventory
     """
-    def tick(self, world: G._WorldState, markets: Dict[str, Market], tick: int):
+    def tick(
+        self,
+        world: G._WorldState,
+        markets: Dict[str, Market],
+        tick: int,
+        rng: random.Random,
+    ) -> None:
         for building in world.buildings.values():
             for unit in building.units.values():
                 for m in unit.machines:
@@ -315,7 +348,13 @@ class VehicleBehavior(Behavior):
             moved = True
         return moved
 
-    def tick(self, world: G._WorldState, markets: Dict[str, Market], tick: int):
+    def tick(
+        self,
+        world: G._WorldState,
+        markets: Dict[str, Market],
+        tick: int,
+        rng: random.Random,
+    ) -> None:
         for v in world.vehicles.values():
             if v.status == "moving" and v.destination:
                 speed = int(v.current_speed or v.vehicle_type.max_speed)
@@ -368,11 +407,12 @@ class VehicleBehavior(Behavior):
                     v.status = "idle"
 
 class BehaviorManager:
-    def __init__(self, world: G._WorldState, markets: Dict[str, Market]):
+    def __init__(self, world: G._WorldState, markets: Dict[str, Market], seed: int = 0):
         self.world = world
         self.markets = markets
         self.behaviors: List[Behavior] = []
         self.tick_count: int = 0
+        self.random = random.Random(seed)
 
     def register(self, behavior: Behavior) -> None:
         self.behaviors.append(behavior)
@@ -380,18 +420,18 @@ class BehaviorManager:
     def tick(self) -> None:
         self.tick_count += 1
         for behavior in self.behaviors:
-            behavior.tick(self.world, self.markets, self.tick_count)
+            behavior.tick(self.world, self.markets, self.tick_count, self.random)
 
 # -----------------------------------
 # Main Simulation Loop
 # -----------------------------------
 
-def main(ticks: int = 1) -> None:
+def main(ticks: int = 1, seed: int = 0) -> None:
     world = load_world()
     markets = {res_id: Market(world, res_id) for res_id in ResourceDefs}
     for m in markets.values():
         m.markets = markets
-    bm = BehaviorManager(world, markets)
+    bm = BehaviorManager(world, markets, seed=seed)
 
     bm.register(MarketBehavior())
     bm.register(CompanyBehavior())
