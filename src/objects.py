@@ -464,16 +464,18 @@ class TechnologyDefinition(BaseModel):
 
 class _FinancialEntityInstance(BaseModel):
     instance_id: int = get_instance_id()
-    resources: _ResourceAmounts
+    resources: _ResourceAmounts = Field(default_factory=dict)
     # Building ids
-    buildings: List[int]
-    land_owned: List[int]
+    buildings: List[int] = Field(default_factory=list)
+    land_owned: List[int] = Field(default_factory=list)
+    fair_values: Dict[str, Decimal] = Field(default_factory=dict)
 
 class _CompanyInstance(_FinancialEntityInstance):
-    techs: List[str]
+    techs: List[str] = Field(default_factory=list)
     domain: Optional[str] = None
     executive_slots: List[_JobSlot] = Field(default_factory=list)
     segments: Dict[str, _BusinessSegment] = Field(default_factory=dict)
+    
 
 # Simple resource‑conversion recipe (updated to reference machine *IDs*)
 class ResourceConversion(BaseModel):
@@ -604,16 +606,16 @@ class EducationCategory(BaseModel):
         return None
     
 class _PersonInstance(_FinancialEntityInstance):
-    personality_traits: List[str] = Field(default_factory=list)
+    personality_traits: List[_PersonalityTrait] = Field(default_factory=list)
     memory: PersonMemory = Field(default_factory=PersonMemory)
-    education: Optional[EducationCategory]
+    education: Optional[EducationCategory] = None
 
     job_slot_id: Optional[int] = None
 
     domain: Optional[str] = None
     
-    employer_id: Optional[int]
-    works_at: Optional[int]
+    employer_id: Optional[int] = None
+    works_at: Optional[int] = None
     
     inventory: _Inventory
 

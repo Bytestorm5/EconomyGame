@@ -20,6 +20,19 @@ ResourceDefs: Dict[str, G.Resource] = REGISTRY.get("Resource", {}) # type: ignor
 PresetDefs: Dict[str, G.ResourceMarketPreset] = REGISTRY.get("ResourceMarketPreset", {}) # type: ignore
 ConvDefs: Dict[str, G.ResourceConversion] = REGISTRY.get("ResourceConversion", {}) # type: ignore
 
+def _update_fair_value(agent: G._FinancialEntityInstance, resource_id: str, market_price: Decimal,
+                       rng: random.Random, lr: float, noise_scale: float) -> Decimal:
+    """
+    Evolve the agent’s fair-value estimate toward the observed price,
+    with a little zero-mean noise (models imperfect information).
+    """
+    current = agent.fair_values.get(resource_id, market_price)
+    error   = market_price - current
+    noise   = Decimal(str(rng.uniform(-noise_scale, noise_scale))) * market_price
+    new_val = current + Decimal(str(lr)) * error + noise        # simple exponential learning
+    agent.fair_values[resource_id] = max(Decimal("0.01"), new_val)
+    return new_val
+
 # -----------------------------------
 # Persistence
 # -----------------------------------
@@ -103,6 +116,7 @@ class Market:
         self.prev_price: Decimal = self.price
         # Will be set externally to access other markets (e.g., fuel)
         self.markets: Dict[str, Market] = {}
+        self.volume_weighted_price: Decimal = self.price        # <── NEW
 
     def compute_supply_demand(self, tick: int) -> Tuple[Decimal, Decimal]:
         supply = sum(
@@ -115,47 +129,92 @@ class Market:
         )
         return Decimal(supply), Decimal(demand)
 
-    def update_prices(self, tick: int, rng: random.Random) -> None:
-        """Update ``self.price`` based on supply/demand and cross elasticities.
-
-        The ``rng`` parameter introduces deterministic noise so that running the
-        simulation with the same seed reproduces identical price paths.
+    def update_prices(self, world: G._WorldState, tick: int, rng: random.Random) -> None:
         """
+        Drop-in replacement that eliminates the downward price drift.
+
+        Key change: use the demand-to-supply ratio (1.0 = balance) instead of the
+        old (d − s)/s difference term.  Cross-elasticities, menu cost checks, and
+        price-stickiness all behave exactly as before.
+        """
+        # Respect price-stickiness
         if not self.preset or tick - self.last_update < self.preset.price_stickiness:
             self.prev_price = self.price
             return
-        s, d = self.compute_supply_demand(tick)
-        old_price = self.price
-        if s > 0:
-            delta = (d - s) / s
-            # factor in price changes of related resources
-            for rid, ce in self.preset.cross_elasticities.items():
-                mkt = self.markets.get(rid)
-                if not mkt:
-                    continue
-                prev = getattr(mkt, "prev_price", mkt.price)
-                if prev:
-                    delta += ce * ((mkt.price - prev) / prev)
-            # random noise for semi-efficient markets
-            delta += Decimal(str(rng.uniform(-0.05, 0.05)))
-            change = (old_price * (delta ** (Decimal(1) / self.preset.elasticity))) - old_price
-            if abs(change) < self.preset.menu_cost:
-                self.prev_price = old_price
-                return
-            new_price = old_price + change * self.adjustment_rate
-            self.price = max(Decimal("0.01"), new_price)
-            self.last_update = tick
-        self.prev_price = old_price
 
-    def get_available_supply(self, actor_type: str) -> Decimal:
-        total = Decimal(0)
-        for b in self.world.buildings.values():
-            btype = getattr(b.definition, 'building_type', None)
-            if actor_type == 'person' and btype != 'Retail':
-                continue
-            inv = getattr(b, 'inventory', {})
-            total += inv.get(self.resource_id, Decimal(0))
-        return total
+        supply, demand = self.compute_supply_demand(tick)
+        old_price = self.price
+
+        # ----------------------------------------------------------
+        # 0-supply or 0-demand special-cases
+        # ----------------------------------------------------------
+        if supply == 0 and demand > 0:
+            # Walk upward toward the highest bid (limit-up style)
+            best_bid = max(
+                (o.limit_price for o in self.order_book.orders
+                if o.side == "buy" and o.timestamp == tick),
+                default=None
+            )
+            if best_bid is not None:
+                self.price += (best_bid - old_price) * self.adjustment_rate
+                self.last_update = tick
+            self.prev_price = old_price
+            return
+
+        if demand == 0 and supply > 0:
+            # Walk downward toward the lowest ask (limit-down style)
+            best_ask = min(
+                (o.limit_price for o in self.order_book.orders
+                if o.side == "sell" and o.timestamp == tick),
+                default=None
+            )
+            if best_ask is not None:
+                self.price += (best_ask - old_price) * self.adjustment_rate
+                self.last_update = tick
+            self.prev_price = old_price
+            return
+        if supply == 0 and demand == 0:
+            # Market with NUTHIN?
+            self.price = self.prev_price
+            return
+
+        trades = self.order_book.match(tick)
+        
+        if trades:
+            tot_qty  = sum(qty for *_ , qty in trades)
+            wtd_sum  = sum(price * qty for *_ , price, qty in trades)
+            tick_vwap = wtd_sum / tot_qty
+
+            α = Decimal("0.25")                  # 25 % weight on the latest tick; tweak as you like
+            self.volume_weighted_price = ((1-α) * self.volume_weighted_price) + (α * tick_vwap)
+        else:
+            # no trades this tick → nudge very slowly toward the quoted spot
+            self.volume_weighted_price = (self.volume_weighted_price + self.price) / Decimal(2)
+            
+        self.prev_price = self.price
+        for buy, sell, price, qty in trades:
+            if buy.actor_type == 'company':
+                comp = world.companies.get(buy.actor_id)
+                if comp:
+                    comp.resources[buy.resource_id] = comp.resources.get(buy.resource_id, Decimal(0)) + qty
+                    comp.resources['money'] = comp.resources.get('money', Decimal(0)) - price * qty
+                self.price = price
+            if sell.actor_type == 'company':
+                comp = world.companies.get(sell.actor_id)
+                if comp:
+                    comp.resources[sell.resource_id] = comp.resources.get(sell.resource_id, Decimal(0)) - qty
+                    comp.resources['money'] = comp.resources.get('money', Decimal(0)) + price * qty
+                self.price = price
+    
+    # def get_available_supply(self, actor_type: str) -> Decimal:
+    #     total = Decimal(0)
+    #     for b in self.world.buildings.values():
+    #         btype = getattr(b.definition, 'building_type', None)
+    #         if actor_type == 'person' and btype != 'Retail':
+    #             continue
+    #         inv = getattr(b, 'inventory', {})
+    #         total += inv.get(self.resource_id, Decimal(0))
+    #     return total
 
     def estimate_shipping_cost(self, company_id: int, quantity: Decimal, supplier_id: int) -> Decimal:
         """
@@ -245,21 +304,8 @@ class MarketBehavior(Behavior):
     ) -> None:
         # first update prices for all markets
         for market in markets.values():
-            market.update_prices(tick, rng)
-        # perform order matching after prices settle
-        for market in markets.values():
-            trades = market.order_book.match(tick)
-            for buy, sell, price, qty in trades:
-                if buy.actor_type == 'company':
-                    comp = world.companies.get(buy.actor_id)
-                    if comp:
-                        comp.resources[buy.resource_id] = comp.resources.get(buy.resource_id, Decimal(0)) + qty
-                        comp.resources['money'] = comp.resources.get('money', Decimal(0)) - price * qty
-                if sell.actor_type == 'company':
-                    comp = world.companies.get(sell.actor_id)
-                    if comp:
-                        comp.resources[sell.resource_id] = comp.resources.get(sell.resource_id, Decimal(0)) - qty
-                        comp.resources['money'] = comp.resources.get('money', Decimal(0)) + price * qty
+            market.update_prices(world, tick, rng)
+            
         # mark new prices as previous for next tick
         for market in markets.values():
             market.prev_price = market.price
@@ -268,27 +314,83 @@ class CompanyBehavior(Behavior):
     def __init__(self) -> None:
         ...
 
-    def tick(
-        self,
-        world: G._WorldState,
-        markets: Dict[str, Market],
-        tick: int,
-        rng: random.Random,
-    ) -> None:
-        ...
+    _LR            = 0.25      # learning-rate toward market
+    _NOISE_SCALE   = 0.02      # ±2 % random observation error
+    _THRESHOLD_PCT = Decimal("0.03")   # 3 % mis-pricing before acting
+    _SPEC_FRAC     = Decimal("0.30")   # deploy up to 30 % of cash / stock
+
+    def tick(self, world, markets, tick, rng):
+        for comp in world.companies.values():
+            cash = comp.resources.get("money", Decimal(0))
+            for rid, mkt in markets.items():
+                fv = _update_fair_value(comp, rid, mkt.volume_weighted_price, rng,
+                                        self._LR, self._NOISE_SCALE)
+                mis_pct = (fv - mkt.price) / mkt.price
+                if mis_pct > self._THRESHOLD_PCT and cash > 0:           # buy low
+                    budget   = cash * self._SPEC_FRAC
+                    qty      = (budget / mkt.price).quantize(Decimal("1."))
+                    if qty > 0:
+                        mkt.order_book.submit(Order(actor_type="company",
+                                                    actor_id=comp.instance_id,
+                                                    resource_id=rid,
+                                                    quantity=qty,
+                                                    limit_price=fv,
+                                                    side="buy",
+                                                    timestamp=tick))
+                elif mis_pct < -self._THRESHOLD_PCT:                     # sell high
+                    stock = comp.resources.get(rid, Decimal(0))
+                    qty   = (stock * self._SPEC_FRAC).quantize(Decimal("1."))
+                    if qty > 0:
+                        mkt.order_book.submit(Order(actor_type="company",
+                                                    actor_id=comp.instance_id,
+                                                    resource_id=rid,
+                                                    quantity=qty,
+                                                    limit_price=fv,
+                                                    side="sell",
+                                                    timestamp=tick))
 
 class PersonBehavior(Behavior):
     def __init__(self) -> None:
         ...
 
-    def tick(
-        self,
-        world: G._WorldState,
-        markets: Dict[str, Market],
-        tick: int,
-        rng: random.Random,
-    ) -> None:
-        ...
+    _LR            = 0.05
+    _NOISE_SCALE   = 0.10      # ±10 % observational noise
+    _THRESHOLD_PCT = Decimal("0.10")   # need big gap to speculate
+    _SPEC_FRAC     = Decimal("0.10")
+
+    def tick(self, world, markets, tick, rng):
+        for p in world.population.values():
+            cash = p.resources.get("money", Decimal(0))
+            for rid, mkt in markets.items():
+                fv = _update_fair_value(p, rid, mkt.price, rng,
+                                        self._LR, self._NOISE_SCALE)
+                mis_pct = (fv - mkt.price) / mkt.price
+                if mis_pct > self._THRESHOLD_PCT and cash > 0:
+                    budget = cash * self._SPEC_FRAC
+                    qty = (budget / mkt.price).quantize(Decimal("1."))
+                    if qty > 0:
+                        mkt.order_book.submit(Order(
+                            actor_type="person",
+                            actor_id=p.instance_id,
+                            resource_id=rid,
+                            quantity=qty,
+                            limit_price=fv,
+                            side="buy",
+                            timestamp=tick
+                        ))
+                elif mis_pct < -self._THRESHOLD_PCT:
+                    stock = p.resources.get(rid, Decimal(0))
+                    qty = (stock * self._SPEC_FRAC).quantize(Decimal("1."))
+                    if qty > 0:
+                        mkt.order_book.submit(Order(
+                            actor_type="person",
+                            actor_id=p.instance_id,
+                            resource_id=rid,
+                            quantity=qty,
+                            limit_price=fv,
+                            side="sell",
+                            timestamp=tick
+                        ))
 
 class MachineBehavior(Behavior):
     """
