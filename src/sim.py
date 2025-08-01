@@ -75,29 +75,6 @@ class OrderBook:
     def submit(self, order: Order) -> None:
         self.orders.append(order)
 
-    def match(self, tick: int) -> List[Tuple[Order, Order, Decimal, Decimal]]:
-        buys = sorted(
-            (o for o in self.orders if o.side == "buy" and o.timestamp == tick),
-            key=lambda o: (-o.limit_price, o.timestamp)
-        )
-        sells = sorted(
-            (o for o in self.orders if o.side == "sell" and o.timestamp == tick),
-            key=lambda o: (o.limit_price, o.timestamp)
-        )
-        trades: List[Tuple[Order, Order, Decimal, Decimal]] = []
-        for buy in buys:
-            for sell in sells:
-                if buy.resource_id != sell.resource_id or buy.quantity <= 0 or sell.quantity <= 0:
-                    continue
-                if buy.limit_price >= sell.limit_price:
-                    price = (buy.limit_price + sell.limit_price) / Decimal(2)
-                    trade_qty = min(buy.quantity, sell.quantity)
-                    trades.append((buy, sell, price, trade_qty))
-                    buy.quantity -= trade_qty
-                    sell.quantity -= trade_qty
-        self.orders = [o for o in self.orders if o.quantity > 0]
-        return trades
-
 # -----------------------------------
 # Market (Single Resource)
 # -----------------------------------
@@ -129,6 +106,36 @@ class Market:
         )
         return Decimal(supply), Decimal(demand)
 
+    def exec_orders(self, world: G._WorldState, tick: int) -> List[Tuple[Order, Order, Decimal, Decimal]]:
+        buys = sorted(
+            (o for o in self.order_book.orders if o.side == "buy" and o.timestamp == tick),
+            key=lambda o: (-o.limit_price, o.timestamp)
+        )
+        all_sells = [o for o in self.order_book.orders if o.side == "sell" and o.timestamp == tick]        
+        trades: List[Tuple[Order, Order, Decimal, Decimal]] = []
+        for buy in buys:
+            known_actors = []
+            if buy.actor_id in world.companies:
+                known_actors =  world.companies[buy.actor_id].known_actors
+            else:
+                known_actors =  world.population[buy.actor_id].known_actors
+            # Limit this buyer's market to sellers that they know about
+            sells = sorted(
+                [s for s in all_sells if s.actor_id in known_actors],
+                key=lambda o: (self.get_effective_price(buy, o.actor_id), o.timestamp)
+            )
+            for sell in sells:
+                if buy.resource_id != sell.resource_id or buy.quantity <= 0 or sell.quantity <= 0:
+                    continue
+                if buy.limit_price >= sell.limit_price:
+                    price = (buy.limit_price + sell.limit_price) / Decimal(2)
+                    trade_qty = min(buy.quantity, sell.quantity)
+                    trades.append((buy, sell, price, trade_qty))
+                    buy.quantity -= trade_qty
+                    sell.quantity -= trade_qty
+        self.order_book.orders = [o for o in self.order_book.orders if o.quantity > 0]
+        return trades
+    
     def update_prices(self, world: G._WorldState, tick: int, rng: random.Random) -> None:
         """
         Drop-in replacement that eliminates the downward price drift.
@@ -178,7 +185,7 @@ class Market:
             self.price = self.prev_price
             return
 
-        trades = self.order_book.match(tick)
+        trades = self.exec_orders(world, tick)
         
         if trades:
             tot_qty  = sum(qty for *_ , qty in trades)
@@ -193,18 +200,25 @@ class Market:
             
         self.prev_price = self.price
         for buy, sell, price, qty in trades:
+            # Buy Side
             if buy.actor_type == 'company':
                 comp = world.companies.get(buy.actor_id)
-                if comp:
-                    comp.resources[buy.resource_id] = comp.resources.get(buy.resource_id, Decimal(0)) + qty
-                    comp.resources['money'] = comp.resources.get('money', Decimal(0)) - price * qty
-                self.price = price
+            else:
+                comp = world.population.get(buy.actor_id)
+            if comp:
+                comp.resources[buy.resource_id] = comp.resources.get(buy.resource_id, Decimal(0)) + qty
+                comp.resources['money'] = comp.resources.get('money', Decimal(0)) - price * qty
+            self.price = price
+            
+            # Sell Side
             if sell.actor_type == 'company':
-                comp = world.companies.get(sell.actor_id)
-                if comp:
-                    comp.resources[sell.resource_id] = comp.resources.get(sell.resource_id, Decimal(0)) - qty
-                    comp.resources['money'] = comp.resources.get('money', Decimal(0)) + price * qty
-                self.price = price
+                comp = world.companies.get(buy.actor_id)
+            else:
+                comp = world.population.get(buy.actor_id)
+            if comp:
+                comp.resources[sell.resource_id] = comp.resources.get(sell.resource_id, Decimal(0)) - qty
+                comp.resources['money'] = comp.resources.get('money', Decimal(0)) + price * qty
+            self.price = price
     
     # def get_available_supply(self, actor_type: str) -> Decimal:
     #     total = Decimal(0)

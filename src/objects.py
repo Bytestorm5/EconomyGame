@@ -54,9 +54,20 @@ class EffectBlock(BaseModel):
 # Resources
 # ────────────────────────────────────────────────────────────────────────────
 
+# Used to determine storage
+# Each ResourceType requires storage that's compatible with it
 class ResourceType(BaseModel):
     id: str
-
+    
+# Used to classify customer/business needs/wants.
+class ResourceDemand(BaseModel):
+    id: str
+    is_need: bool = False # If true, agent will do anything possible to obtain   
+    quantity: PositiveInt = 1
+    min_time_until_repeat: Optional[int] = None # If fulfilled, will not surface again for this many ticks
+    demand_can_occur: Optional[ConditionBlock] # If not present, can always occur
+    chance_per_tick: float # 0-1 chance that this demand will occur if demand_can_occur is met
+    
 class ResourceMarketPreset(BaseModel):
     # We define some "presets" for how the market for different resources work
     # e.g. we may define a preset for how "luxury" assets work vs. how "fuel" assets work
@@ -76,6 +87,11 @@ class Resource(BaseModel):
     cost_per: Decimal = Field(..., description="Cost per 1 unit of this resource")
     type: ResourceType
     market_behavior: str
+    # Dictionary of ResourceDemand ids to the amount of that demand's quantity filled by one unit of this resource
+    # E.g. Burger may fulfill 0.25 hunger, whereas lobster may fulfill 1.2
+    fulfills_demand: dict[str, float]
+    
+    expires_in: Optional[int] # Amount of ticks this resource will last. Forever if not defined.
 
     # allow int/float literals in JSON/YAML configs
     @validator("cost_per", pre=True)
@@ -383,11 +399,12 @@ class _BuildingInstance(BaseModel):
 # Land
 # ────────────────────────────────────────────────────────────────────────────
 
-class LandState(BaseModel):
-    """Dummy class describing the *type* of land – allows a simple tree."""
-
-    id: str
-    parent_id: Optional[str] = None
+class LandState(Enum):
+    WILD_UNBUILDABLE = 3
+    WILD_BUILDABLE = 0
+    ROAD = 1
+    BUILDING = 2
+    
     
 class _LandParcel(BaseModel):
     """A rectangular parcel on the map."""
@@ -398,7 +415,7 @@ class _LandParcel(BaseModel):
     # size is always a single grid square
 
     # dynamic data
-    state_id: str = Field(default="wild")  # key into LAND_STATE_REGISTRY
+    state_id: LandState = LandState.WILD_BUILDABLE
     owner_company_id: Optional[str] = None
 
     # Optional link to a building (if state is "building")
@@ -422,7 +439,8 @@ class VehicleDefinition(BaseModel):
 
     # on‑board capacities
     fuel_capacity: Decimal = Field(..., description="How many units of fuel it can hold")
-    cargo_inventory_size: Decimal
+    cargo_inventory_size: Decimal = Field(..., description="How much space does this vehicle have for cargo?")
+    carry_capacity: Decimal = Field(..., description="How much weight can this vehicle carry?")
 
     @validator("max_speed", "fuel_consumption", "fuel_capacity", pre=True)
     def to_decimal(cls, v):
@@ -468,14 +486,17 @@ class _FinancialEntityInstance(BaseModel):
     # Building ids
     buildings: List[int] = Field(default_factory=list)
     land_owned: List[int] = Field(default_factory=list)
+    
+    # Trade variables
+    ## What this entity believes is the fair value for this item
     fair_values: Dict[str, Decimal] = Field(default_factory=dict)
+    ## The price at which this entity last sold this item- behaves differently based on menu cost & other factors
+    sale_values: Dict[str, Decimal] = Field(default_factory=dict)
+    ## The market actors that this entity is aware of- matches on instanceid of FinancialEntityInstance
+    known_actors: list[int] = Field(default_factory=list)
 
 class _CompanyInstance(_FinancialEntityInstance):
     techs: List[str] = Field(default_factory=list)
-    domain: Optional[str] = None
-    executive_slots: List[_JobSlot] = Field(default_factory=list)
-    segments: Dict[str, _BusinessSegment] = Field(default_factory=dict)
-    
 
 # Simple resource‑conversion recipe (updated to reference machine *IDs*)
 class ResourceConversion(BaseModel):
@@ -546,32 +567,6 @@ class _JobSlot(BaseModel):
     department_id: Optional[str] = None
     segment_id: Optional[str] = None
 
-
-class _Team(BaseModel):
-    id: str
-    name: str
-    unit_ids: List[str] = Field(default_factory=list)
-    budget: Decimal = Decimal(0)
-    lead_slot: _JobSlot = Field(default_factory=lambda: _JobSlot(role=JobRole.lead))
-    operator_slots: List[_JobSlot] = Field(default_factory=list)
-
-
-class _Department(BaseModel):
-    id: str
-    name: str
-    manager_slots: List[_JobSlot] = Field(default_factory=list)
-    teams: Dict[str, _Team] = Field(default_factory=dict)
-    budget: Decimal = Decimal(0)
-
-
-class _BusinessSegment(BaseModel):
-    id: str
-    name: str
-    director_slots: List[_JobSlot] = Field(default_factory=list)
-    departments: Dict[str, _Department] = Field(default_factory=dict)
-    inventory_for_sale: Dict[str, Decimal] = Field(default_factory=dict)
-    budget: Decimal = Decimal(0)
-
 class EducationCategory(BaseModel):
     id: str
     display_name: str
@@ -632,7 +627,7 @@ class _WorldState(BaseModel):
     population: Dict[int, _PersonInstance] = Field(default_factory=dict)
     vehicles: Dict[int, _VehicleInstance] = Field(default_factory=dict)
     registry: Dict[str, dict] = Field(default_factory=dict)
-    emails: List[EmailMessage] = Field(default_factory=list)
+    # emails: List[EmailMessage] = Field(default_factory=list)
     internet: Dict[str, str] = Field(default_factory=dict)
 
     jobs: Dict[int, _JobSlot] = Field(default_factory=dict)
