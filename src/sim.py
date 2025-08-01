@@ -19,6 +19,7 @@ REGISTRY = register_content(ALL_SOURCES)
 ResourceDefs: Dict[str, G.Resource] = REGISTRY.get("Resource", {}) # type: ignore
 PresetDefs: Dict[str, G.ResourceMarketPreset] = REGISTRY.get("ResourceMarketPreset", {}) # type: ignore
 ConvDefs: Dict[str, G.ResourceConversion] = REGISTRY.get("ResourceConversion", {}) # type: ignore
+DemandDefs: Dict[str, G.ResourceDemand] = REGISTRY.get("ResourceDemand", {}) # type: ignore
 
 def _update_fair_value(agent: G._FinancialEntityInstance, resource_id: str, market_price: Decimal,
                        rng: random.Random, lr: float, noise_scale: float) -> Decimal:
@@ -32,6 +33,10 @@ def _update_fair_value(agent: G._FinancialEntityInstance, resource_id: str, mark
     new_val = current + Decimal(str(lr)) * error + noise        # simple exponential learning
     agent.fair_values[resource_id] = max(Decimal("0.01"), new_val)
     return new_val
+
+def evaluate_condition(cond: Optional[G.ConditionBlock], world: G._WorldState, person: Optional[G._PersonInstance] = None) -> bool:
+    # Placeholder for future DSL evaluation
+    return True
 
 # -----------------------------------
 # Persistence
@@ -74,6 +79,69 @@ class OrderBook:
 
     def submit(self, order: Order) -> None:
         self.orders.append(order)
+
+class MarketingOrder(BaseModel):
+    order_id: int = Field(default_factory=get_instance_id)
+    company_id: int
+    quantity: int
+    limit_price: Decimal
+    timestamp: int
+
+class MarketingMarket:
+    def __init__(self, world: G._WorldState, base_price: Decimal = Decimal("1")):
+        self.world = world
+        self.price: Decimal = base_price
+        self.order_book: List[MarketingOrder] = []
+        self.last_update: int = 0
+
+    def submit(self, order: MarketingOrder) -> None:
+        self.order_book.append(order)
+
+    def exec_orders(self, tick: int, rng: random.Random) -> None:
+        buys = [o for o in self.order_book if o.timestamp == tick]
+        total_qty = sum(o.quantity for o in buys)
+        if total_qty == 0:
+            return
+        # simple dynamic pricing: price increases with demand
+        self.price = self.price * (Decimal("1") + Decimal(str(total_qty)) / Decimal("100"))
+        population = list(self.world.population.values())
+        for order in buys:
+            for _ in range(order.quantity):
+                if not population:
+                    break
+                person = rng.choice(population)
+                self._apply_impression(person, order.company_id, rng)
+        self.order_book = [o for o in self.order_book if o.timestamp > tick]
+
+    def update_prices(self, world: G._WorldState, tick: int, rng: random.Random) -> None:
+        self.exec_orders(tick, rng)
+
+    def _apply_impression(self, person: G._PersonInstance, company_id: int, rng: random.Random) -> None:
+        roll = rng.random()
+        if roll < 0.15 * person.personality.marketing_susceptibility:
+            if company_id not in person.known_actors:
+                person.known_actors.append(company_id)
+        elif roll < 0.20 * person.personality.marketing_susceptibility:
+            if company_id not in person.known_actors:
+                person.known_actors.append(company_id)
+            self._share_information(person, company_id, rng)
+        elif roll > 0.98:
+            if company_id in person.known_actors:
+                person.known_actors.remove(company_id)
+            self._share_information(person, company_id, rng, negative=True)
+
+    def _share_information(self, person: G._PersonInstance, company_id: int, rng: random.Random, negative: bool = False) -> None:
+        for other_id, rel in person.personal_relationship.items():
+            if rng.random() < rel * person.personality.info_sharing:
+                other = self.world.population.get(other_id)
+                if not other:
+                    continue
+                if negative:
+                    if company_id in other.known_actors:
+                        other.known_actors.remove(company_id)
+                else:
+                    if company_id not in other.known_actors:
+                        other.known_actors.append(company_id)
 
 # -----------------------------------
 # Market (Single Resource)
@@ -133,6 +201,13 @@ class Market:
                     trades.append((buy, sell, price, trade_qty))
                     buy.quantity -= trade_qty
                     sell.quantity -= trade_qty
+                    # share knowledge of trading partner
+                    buyer = world.companies.get(buy.actor_id) if buy.actor_type == 'company' else world.population.get(buy.actor_id)
+                    seller = world.companies.get(sell.actor_id) if sell.actor_type == 'company' else world.population.get(sell.actor_id)
+                    if buyer and sell.actor_id not in buyer.known_actors:
+                        buyer.known_actors.append(sell.actor_id)
+                    if seller and buy.actor_id not in seller.known_actors:
+                        seller.known_actors.append(buy.actor_id)
         self.order_book.orders = [o for o in self.order_book.orders if o.quantity > 0]
         return trades
     
@@ -303,6 +378,7 @@ class Behavior:
         self,
         world: G._WorldState,
         markets: Dict[str, Market],
+        marketing: MarketingMarket,
         tick: int,
         rng: random.Random,
     ) -> None:
@@ -313,6 +389,7 @@ class MarketBehavior(Behavior):
         self,
         world: G._WorldState,
         markets: Dict[str, Market],
+        marketing: MarketingMarket,
         tick: int,
         rng: random.Random,
     ) -> None:
@@ -324,6 +401,17 @@ class MarketBehavior(Behavior):
         for market in markets.values():
             market.prev_price = market.price
 
+class MarketingBehavior(Behavior):
+    def tick(
+        self,
+        world: G._WorldState,
+        markets: Dict[str, Market],
+        marketing: MarketingMarket,
+        tick: int,
+        rng: random.Random,
+    ) -> None:
+        marketing.update_prices(world, tick, rng)
+
 class CompanyBehavior(Behavior):
     def __init__(self) -> None:
         ...
@@ -333,7 +421,7 @@ class CompanyBehavior(Behavior):
     _THRESHOLD_PCT = Decimal("0.03")   # 3 % mis-pricing before acting
     _SPEC_FRAC     = Decimal("0.30")   # deploy up to 30 % of cash / stock
 
-    def tick(self, world, markets, tick, rng):
+    def tick(self, world, markets, marketing, tick, rng):
         for comp in world.companies.values():
             cash = comp.resources.get("money", Decimal(0))
             for rid, mkt in markets.items():
@@ -372,9 +460,18 @@ class PersonBehavior(Behavior):
     _THRESHOLD_PCT = Decimal("0.10")   # need big gap to speculate
     _SPEC_FRAC     = Decimal("0.10")
 
-    def tick(self, world, markets, tick, rng):
+    def tick(self, world, markets, marketing, tick, rng):
         for p in world.population.values():
             cash = p.resources.get("money", Decimal(0))
+            # surface new demands
+            for demand in DemandDefs.values():
+                if demand.id in p.active_demands:
+                    continue
+                if tick < p.demand_cooldowns.get(demand.id, 0):
+                    continue
+                if evaluate_condition(demand.demand_can_occur, world, p) and rng.random() <= demand.chance_per_tick:
+                    p.active_demands[demand.id] = int(demand.quantity)
+
             for rid, mkt in markets.items():
                 fv = _update_fair_value(p, rid, mkt.price, rng,
                                         self._LR, self._NOISE_SCALE)
@@ -406,6 +503,38 @@ class PersonBehavior(Behavior):
                             timestamp=tick
                         ))
 
+            # attempt to satisfy active demands
+            for d_id, qty in list(p.active_demands.items()):
+                options = [res for res in ResourceDefs.values() if d_id in res.fulfills_demand]
+                if not options:
+                    continue
+                res = min(options, key=lambda r: markets[r.id].price / Decimal(str(r.fulfills_demand[d_id])))
+                price_adj = Decimal(1) + Decimal(str(p.personality.comfort_value * 0.05 + p.personality.time_value * 0.05))
+                limit = markets[res.id].price * price_adj
+                if cash >= limit * qty:
+                    markets[res.id].order_book.submit(Order(
+                        actor_type="person",
+                        actor_id=p.instance_id,
+                        resource_id=res.id,
+                        quantity=Decimal(qty),
+                        limit_price=limit,
+                        side="buy",
+                        timestamp=tick
+                    ))
+                    cash -= limit * qty
+                    del p.active_demands[d_id]
+                    d_def = DemandDefs.get(d_id)
+                    if d_def and d_def.min_time_until_repeat:
+                        p.demand_cooldowns[d_id] = tick + d_def.min_time_until_repeat
+
+            # share known actors with relationships
+            for actor_id in p.known_actors:
+                for other_id, rel in p.personal_relationship.items():
+                    if rng.random() < rel * p.personality.info_sharing:
+                        other = world.population.get(other_id)
+                        if other and actor_id not in other.known_actors:
+                            other.known_actors.append(actor_id)
+
 class MachineBehavior(Behavior):
     """
     Handles production: consumes inputs and adds outputs to each active machine's inventory
@@ -414,6 +543,7 @@ class MachineBehavior(Behavior):
         self,
         world: G._WorldState,
         markets: Dict[str, Market],
+        marketing: MarketingMarket,
         tick: int,
         rng: random.Random,
     ) -> None:
@@ -472,6 +602,7 @@ class VehicleBehavior(Behavior):
         self,
         world: G._WorldState,
         markets: Dict[str, Market],
+        marketing: MarketingMarket,
         tick: int,
         rng: random.Random,
     ) -> None:
@@ -529,9 +660,10 @@ class VehicleBehavior(Behavior):
 class BehaviorManager:
     """Coordinates all Behaviors and maintains a deterministic random source."""
 
-    def __init__(self, world: G._WorldState, markets: Dict[str, Market], seed: int = 0):
+    def __init__(self, world: G._WorldState, markets: Dict[str, Market], marketing: MarketingMarket, seed: int = 0):
         self.world = world
         self.markets = markets
+        self.marketing = marketing
         self.behaviors: List[Behavior] = []
         self.tick_count: int = 0
         self.random = random.Random(seed)
@@ -542,7 +674,7 @@ class BehaviorManager:
     def tick(self) -> None:
         self.tick_count += 1
         for behavior in self.behaviors:
-            behavior.tick(self.world, self.markets, self.tick_count, self.random)
+            behavior.tick(self.world, self.markets, self.marketing, self.tick_count, self.random)
 
 # -----------------------------------
 # Main Simulation Loop
@@ -555,11 +687,13 @@ def main(ticks: int = 1, seed: int = 0) -> None:
     markets = {res_id: Market(world, res_id) for res_id in ResourceDefs}
     for m in markets.values():
         m.markets = markets
-    bm = BehaviorManager(world, markets, seed=seed)
+    marketing_market = MarketingMarket(world)
+    bm = BehaviorManager(world, markets, marketing_market, seed=seed)
 
     bm.register(MarketBehavior())
     bm.register(CompanyBehavior())
     bm.register(PersonBehavior())
+    bm.register(MarketingBehavior())
     bm.register(VehicleBehavior())
 
     for _ in range(ticks):

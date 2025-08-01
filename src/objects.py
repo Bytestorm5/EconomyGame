@@ -569,6 +569,13 @@ class EducationCategory(BaseModel):
             current = current.parent
             distance += 1
         return None
+
+class Personality(BaseModel):
+    """Personality traits affecting economic behaviour."""
+    comfort_value: float = 1.0
+    time_value: float = 1.0
+    info_sharing: float = 0.5
+    marketing_susceptibility: float = 0.5
     
 class _PersonInstance(_FinancialEntityInstance):
     education: Optional[EducationCategory] = None
@@ -581,6 +588,12 @@ class _PersonInstance(_FinancialEntityInstance):
     works_at: Optional[int] = None
     
     inventory: _Inventory
+
+    personality: Personality = Field(default_factory=Personality)
+
+    # Active demands that this person is currently trying to satisfy
+    active_demands: Dict[str, int] = Field(default_factory=dict)
+    demand_cooldowns: Dict[str, int] = Field(default_factory=dict)
 
     @model_validator(mode="before")
     def init_inventory(cls, values):
