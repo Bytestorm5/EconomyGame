@@ -516,36 +516,6 @@ class ResourceConversion(BaseModel):
 # Individuals
 # ────────────────────────────────────────────────────────────────────────────
 
-class _PersonalityTrait(BaseModel):
-    """Personality trait definition for LLM prompts (instance object)."""
-    id: str
-    description: str
-    coincidence: Dict[str, float] = Field(default_factory=dict)
-
-
-class PersonMemory(BaseModel):
-    """Short and long term memory for individuals."""
-    short_term: List[str] = Field(default_factory=list)
-    long_term: Dict[str, str] = Field(default_factory=dict)
-
-    def add_short(self, entry: str) -> None:
-        self.short_term.append(entry)
-        if len(self.short_term) > 30:
-            self.short_term.pop(0)
-
-
-class EmailMessage(BaseModel):
-    """Simple email object for inter-agent communication."""
-
-    message_id: int = Field(default_factory=get_instance_id)
-    sender_type: Literal["person", "company"]
-    sender_id: int
-    to_people: List[int] = Field(default_factory=list)
-    to_companies: List[int] = Field(default_factory=list)
-    subject: str
-    body: str
-    timestamp: int
-
 
 class JobRole(str, Enum):
     """Hierarchy of job roles."""
@@ -601,12 +571,12 @@ class EducationCategory(BaseModel):
         return None
     
 class _PersonInstance(_FinancialEntityInstance):
-    personality_traits: List[_PersonalityTrait] = Field(default_factory=list)
-    memory: PersonMemory = Field(default_factory=PersonMemory)
     education: Optional[EducationCategory] = None
+    
+    # Dictionary of PersonInstance to a 0-1 chance that they will share information with that Person
+    personal_relationship: dict[int, float]
 
     job_slot_id: Optional[int] = None
-    
     employer_id: Optional[int] = None
     works_at: Optional[int] = None
     
