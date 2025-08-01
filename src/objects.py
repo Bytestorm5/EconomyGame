@@ -606,8 +606,6 @@ class _PersonInstance(_FinancialEntityInstance):
     education: Optional[EducationCategory] = None
 
     job_slot_id: Optional[int] = None
-
-    domain: Optional[str] = None
     
     employer_id: Optional[int] = None
     works_at: Optional[int] = None
@@ -627,8 +625,6 @@ class _WorldState(BaseModel):
     population: Dict[int, _PersonInstance] = Field(default_factory=dict)
     vehicles: Dict[int, _VehicleInstance] = Field(default_factory=dict)
     registry: Dict[str, dict] = Field(default_factory=dict)
-    # emails: List[EmailMessage] = Field(default_factory=list)
-    internet: Dict[str, str] = Field(default_factory=dict)
 
     jobs: Dict[int, _JobSlot] = Field(default_factory=dict)
 
