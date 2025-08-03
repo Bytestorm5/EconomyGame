@@ -84,14 +84,18 @@ class Resource(BaseModel):
     id: str
     display_name: str
     unit_name: str = "unit" # What do we call 1 unit of this resource? e.g. "gallon" for water, "bushel" for corn
+    
+    # Used for valuation
     cost_per: Decimal = Field(..., description="Cost per 1 unit of this resource")
+    quality: Decimal = Field(..., description="Quality of the product expressed as a dollar value.")
+    
     type: ResourceType
     market_behavior: str
     # Dictionary of ResourceDemand ids to the amount of that demand's quantity filled by one unit of this resource
     # E.g. Burger may fulfill 0.25 hunger, whereas lobster may fulfill 1.2
     fulfills_demand: dict[str, float]
     
-    expires_in: Optional[int] # Amount of ticks this resource will last. Forever if not defined.
+    expires_in: Optional[int] = None # Amount of ticks this resource will last. Forever if not defined.
 
     # allow int/float literals in JSON/YAML configs
     @validator("cost_per", pre=True)
@@ -256,7 +260,7 @@ class MachineDefinition(BaseModel):
 
 class _MachineInstance(BaseModel):
     """Concrete machine placed in a Unit."""
-    instance_id: int = get_instance_id()
+    instance_id: int = Field(default_factory=get_instance_id)
     machine: MachineDefinition
     is_active: bool = False
     stored_resources: Dict[str, Decimal] = Field(default_factory=dict)
@@ -300,7 +304,7 @@ class _MachineInstance(BaseModel):
 class _UnitInstance(BaseModel):
     """Sellable / rentable space inside a building."""
 
-    instance_id: int = get_instance_id()
+    instance_id: int = Field(default_factory=get_instance_id)
     owner_company_id: str
     access_team_ids: List[str] = Field(default_factory=list)
     floor_space: PositiveInt = Field(..., description="Maximum usable space in tiles")
@@ -365,7 +369,7 @@ class BuildingDefinition(BaseModel):
 class _BuildingInstance(BaseModel):
     """A concrete building that exists in game‑world."""
 
-    instance_id: int = get_instance_id()
+    instance_id: int = Field(default_factory=get_instance_id)
     land_parcel_id: int
     definition: BuildingDefinition
     owner_company_id: str
@@ -424,6 +428,9 @@ class _LandParcel(BaseModel):
     @property
     def id(self):
         return f"{self.x}-{self.y}"
+    
+    def pos_tuple(self) -> Tuple[int, int]:
+        return self.x, self.y
 
 # ────────────────────────────────────────────────────────────────────────────
 # Vehicles
@@ -447,9 +454,9 @@ class VehicleDefinition(BaseModel):
         return Decimal(str(v))
 
 class _VehicleInstance(BaseModel):
-    instance_id: int = get_instance_id()
+    instance_id: int = Field(default_factory=get_instance_id)
     vehicle_type: VehicleDefinition
-    owner_company_id: str
+    owner_company_id: int
 
     # where am I on the grid?
     position: Tuple[int, int]               # current tile
@@ -481,7 +488,7 @@ class TechnologyDefinition(BaseModel):
     on_unlock: EffectBlock
 
 class _FinancialEntityInstance(BaseModel):
-    instance_id: int = get_instance_id()
+    instance_id: int = Field(default_factory=get_instance_id)
     resources: _ResourceAmounts = Field(default_factory=dict)
     # Building ids
     buildings: List[int] = Field(default_factory=list)
@@ -528,7 +535,7 @@ class JobRole(str, Enum):
 
 class _JobSlot(BaseModel):
     """Dynamic assignment of a job role within a company."""
-    instance_id: int = get_instance_id()
+    instance_id: int = Field(default_factory=get_instance_id)
     role: JobRole
     required_education: List[str] = Field(default_factory=list)
     applicant_ids: List[int] = Field(default_factory=list)
@@ -572,10 +579,12 @@ class EducationCategory(BaseModel):
 
 class Personality(BaseModel):
     """Personality traits affecting economic behaviour."""
-    comfort_value: float = 1.0
-    time_value: float = 1.0
-    info_sharing: float = 0.5
-    marketing_susceptibility: float = 0.5
+    weight: int = 1 # Probability of a specific personality governed by weight
+    
+    comfort_value: float = 1.0 # How much this person values high-quality items
+    time_value: float = 1.0 # How much this person values time ($/tick). Can also be understood as a quantifiation of impatience
+    info_sharing: float = 0.5 # How likely this person is to share information that they have learned
+    marketing_susceptibility: float = 0.5 # How likely this person is to believe marketing
     
 class _PersonInstance(_FinancialEntityInstance):
     education: Optional[EducationCategory] = None

@@ -28,6 +28,9 @@ def _update_fair_value(agent: G._FinancialEntityInstance, resource_id: str, mark
     with a little zero-mean noise (models imperfect information).
     """
     current = agent.fair_values.get(resource_id, market_price)
+    if isinstance(agent, G._PersonInstance):
+        comfort_value = ResourceDefs[resource_id].quality * Decimal(agent.personality.comfort_value)
+        current = min(comfort_value, current) # Product is worth at least this much to this person
     error   = market_price - current
     noise   = Decimal(str(rng.uniform(-noise_scale, noise_scale))) * market_price
     new_val = current + Decimal(str(lr)) * error + noise        # simple exponential learning
@@ -509,8 +512,7 @@ class PersonBehavior(Behavior):
                 if not options:
                     continue
                 res = min(options, key=lambda r: markets[r.id].price / Decimal(str(r.fulfills_demand[d_id])))
-                price_adj = Decimal(1) + Decimal(str(p.personality.comfort_value * 0.05 + p.personality.time_value * 0.05))
-                limit = markets[res.id].price * price_adj
+                limit = markets[res.id].price
                 if cash >= limit * qty:
                     markets[res.id].order_book.submit(Order(
                         actor_type="person",
