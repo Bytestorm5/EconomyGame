@@ -1,6 +1,6 @@
 import json
 from pathlib import Path
-from decimal import Decimal
+from decimal import Decimal, ROUND_UP
 from typing import Dict, Optional, List, Tuple, Literal
 from math import ceil
 import random
@@ -417,21 +417,116 @@ class MarketingBehavior(Behavior):
 
 class CompanyBehavior(Behavior):
     def __init__(self) -> None:
-        ...
+        """Placeholder constructor; kept for future expansion."""
 
     _LR            = 0.25      # learning-rate toward market
     _NOISE_SCALE   = 0.02      # ±2 % random observation error
     _THRESHOLD_PCT = Decimal("0.03")   # 3 % mis-pricing before acting
     _SPEC_FRAC     = Decimal("0.30")   # deploy up to 30 % of cash / stock
 
+    # ── Internal helpers ─────────────────────────────────────────────────────
+    def _find_best_conversion(self, markets: Dict[str, Market]) -> Optional[G.ResourceConversion]:
+        best_conv: Optional[G.ResourceConversion] = None
+        best_profit = Decimal("0")
+        for conv in ConvDefs.values():
+            revenue = sum(markets[rid].price * amt for rid, amt in conv.output_resources.items())
+            cost    = sum(markets[rid].price * amt for rid, amt in conv.input_resources.items())
+            profit  = revenue - cost
+            if profit > best_profit:
+                best_profit = profit
+                best_conv = conv
+        return best_conv if best_profit > 0 else None
+
+    def _acquire_resource(
+        self,
+        comp: G._CompanyInstance,
+        resource_id: str,
+        amount: Decimal,
+        markets: Dict[str, Market],
+        tick: int,
+    ) -> None:
+        have = comp.resources.get(resource_id, Decimal(0))
+        needed = amount - have
+        if needed <= 0:
+            return
+
+        market = markets[resource_id]
+        buy_cost = market.price * needed
+
+        best_conv: Optional[G.ResourceConversion] = None
+        best_cost: Optional[Decimal] = None
+        for conv in ConvDefs.values():
+            if resource_id not in conv.output_resources:
+                continue
+            out_amt = conv.output_resources[resource_id]
+            cycles  = (needed / out_amt).quantize(Decimal("1."), rounding=ROUND_UP)
+            inputs_cost = sum(
+                markets[rid].price * amt for rid, amt in conv.input_resources.items()
+            ) * cycles
+            cost = inputs_cost / needed
+            if best_cost is None or cost < best_cost:
+                best_cost = cost
+                best_conv = conv
+
+        if best_conv and best_cost is not None and best_cost < buy_cost:
+            can_run = True
+            for rid, amt in best_conv.input_resources.items():
+                if comp.resources.get(rid, Decimal(0)) < amt:
+                    can_run = False
+                    break
+            if can_run:
+                for rid, amt in best_conv.input_resources.items():
+                    comp.resources[rid] -= amt
+                for rid, amt in best_conv.output_resources.items():
+                    comp.resources[rid] = comp.resources.get(rid, Decimal(0)) + amt
+                return
+
+        market.order_book.submit(
+            Order(
+                actor_type="company",
+                actor_id=comp.instance_id,
+                resource_id=resource_id,
+                quantity=needed,
+                limit_price=market.price,
+                side="buy",
+                timestamp=tick,
+            )
+        )
+
+    # ── Main behaviour ──────────────────────────────────────────────────────
     def tick(self, world, markets, marketing, tick, rng):
         for comp in world.companies.values():
+            conv = self._find_best_conversion(markets)
+            if conv is not None:
+                for rid, amt in conv.input_resources.items():
+                    self._acquire_resource(comp, rid, amt, markets, tick)
+                if all(comp.resources.get(rid, Decimal(0)) >= amt for rid, amt in conv.input_resources.items()):
+                    for rid, amt in conv.input_resources.items():
+                        comp.resources[rid] -= amt
+                    for rid, amt in conv.output_resources.items():
+                        comp.resources[rid] = comp.resources.get(rid, Decimal(0)) + amt
+                        mkt = markets[rid]
+                        fv = _update_fair_value(
+                            comp, rid, mkt.volume_weighted_price, rng, self._LR, self._NOISE_SCALE
+                        )
+                        mkt.order_book.submit(
+                            Order(
+                                actor_type="company",
+                                actor_id=comp.instance_id,
+                                resource_id=rid,
+                                quantity=amt,
+                                limit_price=fv,
+                                side="sell",
+                                timestamp=tick,
+                            )
+                        )
+
             cash = comp.resources.get("money", Decimal(0))
             for rid, mkt in markets.items():
                 fv = _update_fair_value(comp, rid, mkt.volume_weighted_price, rng,
                                         self._LR, self._NOISE_SCALE)
                 mis_pct = (fv - mkt.price) / mkt.price
-                if mis_pct > self._THRESHOLD_PCT and cash > 0:           # buy low
+                if mis_pct > self._THRESHOLD_PCT and cash > 0:
                     budget   = cash * self._SPEC_FRAC
                     qty      = (budget / mkt.price).quantize(Decimal("1."))
                     if qty > 0:
@@ -442,7 +537,7 @@ class CompanyBehavior(Behavior):
                                                     limit_price=fv,
                                                     side="buy",
                                                     timestamp=tick))
-                elif mis_pct < -self._THRESHOLD_PCT:                     # sell high
+                elif mis_pct < -self._THRESHOLD_PCT:
                     stock = comp.resources.get(rid, Decimal(0))
                     qty   = (stock * self._SPEC_FRAC).quantize(Decimal("1."))
                     if qty > 0:
@@ -466,13 +561,14 @@ class PersonBehavior(Behavior):
     def tick(self, world, markets, marketing, tick, rng):
         for p in world.population.values():
             cash = p.resources.get("money", Decimal(0))
-            # surface new demands
+            # surface new demands – chance influenced by personality
             for demand in DemandDefs.values():
                 if demand.id in p.active_demands:
                     continue
                 if tick < p.demand_cooldowns.get(demand.id, 0):
                     continue
-                if evaluate_condition(demand.demand_can_occur, world, p) and rng.random() <= demand.chance_per_tick:
+                chance = demand.chance_per_tick * (0.5 + p.personality.time_value / 2)
+                if evaluate_condition(demand.demand_can_occur, world, p) and rng.random() <= chance:
                     p.active_demands[demand.id] = int(demand.quantity)
 
             for rid, mkt in markets.items():
