@@ -502,8 +502,25 @@ class _FinancialEntityInstance(BaseModel):
     ## The market actors that this entity is aware of- matches on instanceid of FinancialEntityInstance
     known_actors: list[int] = Field(default_factory=list)
 
+    def valuation(self) -> Decimal:
+        """Return the estimated total value of this entity's held resources."""
+        from sim import ResourceDefs  # Local import to avoid circular dependency
+
+        total = Decimal("0")
+        for rid, qty in self.resources.items():
+            price = self.fair_values.get(rid)
+            if price is None:
+                res_def = ResourceDefs.get(rid)
+                price = res_def.cost_per if res_def else Decimal("0")
+            total += price * qty
+        return total
+
 class _CompanyInstance(_FinancialEntityInstance):
     techs: List[str] = Field(default_factory=list)
+    # Resources this company is irrationally attached to producing
+    focus_resources: List[str] = Field(default_factory=list)
+    # Planning horizon expressed in ticks (1 tick == 1 real hour)
+    planning_horizon: int = 24
 
 # Simple resource‑conversion recipe (updated to reference machine *IDs*)
 class ResourceConversion(BaseModel):
