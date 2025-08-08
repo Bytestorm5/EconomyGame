@@ -13,8 +13,6 @@ from objects import get_instance_id
 # Constants
 WORLD_STATE_PATH = Path("world_state.json")
 ALL_SOURCES = [LOCAL_CONTENT] + MOD_PATHS
-# One simulation tick represents this many real-life hours
-TICK_HOURS = 1
 
 # Load registry
 REGISTRY = register_content(ALL_SOURCES)
@@ -427,22 +425,17 @@ class CompanyBehavior(Behavior):
     _SPEC_FRAC     = Decimal("0.30")   # deploy up to 30 % of cash / stock
 
     # ── Internal helpers ─────────────────────────────────────────────────────
-    def _find_best_conversion(self, comp: G._CompanyInstance, markets: Dict[str, Market]) -> Optional[G.ResourceConversion]:
+    def _find_best_conversion(self, markets: Dict[str, Market]) -> Optional[G.ResourceConversion]:
         best_conv: Optional[G.ResourceConversion] = None
-        best_score = Decimal("0")
+        best_profit = Decimal("0")
         for conv in ConvDefs.values():
-            if comp.focus_resources and not any(rid in comp.focus_resources for rid in conv.output_resources):
-                continue
             revenue = sum(markets[rid].price * amt for rid, amt in conv.output_resources.items())
             cost    = sum(markets[rid].price * amt for rid, amt in conv.input_resources.items())
             profit  = revenue - cost
-            cycle_time = int(conv.default_time_taken) or 1
-            cycles = max(1, comp.planning_horizon // cycle_time)
-            score  = profit * cycles
-            if score > best_score:
-                best_score = score
+            if profit > best_profit:
+                best_profit = profit
                 best_conv = conv
-        return best_conv if best_score > 0 else None
+        return best_conv if best_profit > 0 else None
 
     def _acquire_resource(
         self,
@@ -462,7 +455,6 @@ class CompanyBehavior(Behavior):
 
         best_conv: Optional[G.ResourceConversion] = None
         best_cost: Optional[Decimal] = None
-        infra_cost = Decimal("1000")
         for conv in ConvDefs.values():
             if resource_id not in conv.output_resources:
                 continue
@@ -471,14 +463,12 @@ class CompanyBehavior(Behavior):
             inputs_cost = sum(
                 markets[rid].price * amt for rid, amt in conv.input_resources.items()
             ) * cycles
-            cost = inputs_cost / (out_amt * cycles)
-            unit_savings = market.price - cost
-            long_term_gain = unit_savings * Decimal(comp.planning_horizon)
-            if long_term_gain > infra_cost and (best_cost is None or cost < best_cost):
+            cost = inputs_cost / needed
+            if best_cost is None or cost < best_cost:
                 best_cost = cost
                 best_conv = conv
 
-        if best_conv and best_cost is not None:
+        if best_conv and best_cost is not None and best_cost < buy_cost:
             can_run = True
             for rid, amt in best_conv.input_resources.items():
                 if comp.resources.get(rid, Decimal(0)) < amt:
@@ -506,7 +496,7 @@ class CompanyBehavior(Behavior):
     # ── Main behaviour ──────────────────────────────────────────────────────
     def tick(self, world, markets, marketing, tick, rng):
         for comp in world.companies.values():
-            conv = self._find_best_conversion(comp, markets)
+            conv = self._find_best_conversion(markets)
             if conv is not None:
                 for rid, amt in conv.input_resources.items():
                     self._acquire_resource(comp, rid, amt, markets, tick)
@@ -565,7 +555,7 @@ class PersonBehavior(Behavior):
 
     _LR            = 0.05
     _NOISE_SCALE   = 0.10      # ±10 % observational noise
-    _THRESHOLD_PCT = Decimal("0.10")   # need big gap to speculate
+    _THRESHOLD_PCT = Decimal("0.250")   # need big gap to speculate
     _SPEC_FRAC     = Decimal("0.10")
 
     def tick(self, world, markets, marketing, tick, rng):
