@@ -1,0 +1,10 @@
+{
+  "id": "currency",
+  "elasticity": 0,
+  "cross_elasticities": {},
+  "transaction_cost": 0,
+  "initial_liquidity": 1000000,
+  "price_stickiness": 1,
+  "carry_cost": 0,
+  "menu_cost": 0
+}

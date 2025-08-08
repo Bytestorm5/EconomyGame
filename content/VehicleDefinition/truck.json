@@ -1,0 +1,9 @@
+{
+  "id": "truck",
+  "display_name": "Truck",
+  "max_speed": 20,
+  "fuel_consumption": 1,
+  "fuel_capacity": 100,
+  "cargo_inventory_size": 100,
+  "carry_capacity": 100
+}

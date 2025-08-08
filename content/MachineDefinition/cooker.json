@@ -1,0 +1,16 @@
+{
+  "id": "cooker",
+  "display_name": "Industrial Cooker",
+  "floor_space": 1,
+  "visible": {"condition": null},
+  "can_build": {"condition": null},
+  "operator_requirements": {},
+  "consumes_idle": {},
+  "consumes_active": {},
+  "inventory_capacity": 20,
+  "inventory_resource_type": {"id": "solid"},
+  "conveyor_in_capacity": 0,
+  "conveyor_out_capacity": 0,
+  "change_recipe_cost": {},
+  "possible_recipes": {"cook_food": 1}
+}

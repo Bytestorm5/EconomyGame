@@ -13,7 +13,7 @@ FPS = 30
 # ──────────────────────────────────────────────────────────────────────────────
 
 def _ensure_default_resources() -> None:
-    """Guarantee there is at least a minimal usable resource set (money, fuel, food)."""
+    """Guarantee there is at least a minimal usable resource set."""
     # Money ────────────────────────────────────────────────────────────────────
     if "money" not in sim.ResourceDefs:
         currency_type = G.ResourceType(id="currency")
@@ -54,6 +54,31 @@ def _ensure_default_resources() -> None:
             fulfills_demand={},
         )
 
+    # Investment demand used for company shares
+    if "investment" not in sim.DemandDefs:
+        sim.DemandDefs["investment"] = G.ResourceDemand(
+            id="investment",
+            is_need=False,
+            quantity=1,
+            min_time_until_repeat=None,
+            demand_can_occur=None,
+            chance_per_tick=0.0,
+        )
+
+    # Generic company shares resource
+    if "shares" not in sim.ResourceDefs:
+        share_type = G.ResourceType(id="security")
+        sim.ResourceDefs["shares"] = G.Resource(
+            id="shares",
+            display_name="Shares",
+            unit_name="share",
+            cost_per=Decimal("1"),
+            quality=Decimal("0"),
+            type=share_type,
+            market_behavior="equity",
+            fulfills_demand={"investment": 1},
+        )
+
 
 def _ensure_default_agents(world: G._WorldState, rng: random.Random) -> None:
     """Populate the world with a starter company and some citizens so the sim has actors."""
@@ -69,13 +94,25 @@ def _ensure_default_agents(world: G._WorldState, rng: random.Random) -> None:
     # ----------------------------------------------------------------– Company
     if not world.companies:
         for i in range(10):
-            starter = G._CompanyInstance(resources={"money": Decimal("10000")})
+            starter = G._CompanyInstance(resources={
+                "money": Decimal("10000"),
+                "shares": Decimal("1000000000"),
+            })
             if rng.random() > 0.8:
                 starter.resources['food'] = Decimal(rng.randint(1, 100))
             if rng.random() > 0.3:
                 starter.resources['fuel'] = Decimal(rng.randint(10, 300))
-            vehicle_count = rng.randint(1, 10)
-            for i in range(vehicle_count):
+
+            available = [rid for rid in sim.ResourceDefs.keys() if rid not in ("money", "shares")]
+            if available:
+                starter.focus_resources = rng.sample(available, k=min(len(available), rng.randint(1, 2)))
+            starter.planning_horizon = rng.randint(24, 24 * 90)
+
+            vehicle_def = next(iter(sim.REGISTRY.get("VehicleDefinition", {}).values()), None)
+            vehicle_count = rng.randint(1, 3)
+            for _ in range(vehicle_count):
+                if vehicle_def is None:
+                    break
                 v = G._VehicleInstance(
                     vehicle_type=vehicle_def,
                     owner_company_id=starter.instance_id,
@@ -120,21 +157,15 @@ def _ensure_default_land(world: G._WorldState, width: int = 20, height: int = 20
 
 
 def _init_simulation(seed: int = 0) -> tuple[G._WorldState, sim.BehaviorManager]:
-    """Replicates (and slightly tweaks) sim.main() so we can advance the world one tick at a time."""
     rng = random.Random(seed)
 
-    # ----------------------------------------------------------------– Registry / defs
-    _ensure_default_resources()
-
-    # ----------------------------------------------------------------– Persistent world
     world = sim.load_world()
     _ensure_default_land(world)
     _ensure_default_agents(world, rng)
-
-    # ----------------------------------------------------------------– Markets & behaviors
+    
     markets = {rid: sim.Market(world, rid) for rid in sim.ResourceDefs}
     for m in markets.values():
-        m.markets = markets  # Give every market cross‑refs to the others
+        m.markets = markets
 
     marketing_market = sim.MarketingMarket(world)
 
@@ -158,6 +189,7 @@ def _color_for_land(state: G.LandState) -> tuple[int, int, int]:
         G.LandState.ROAD:             (120, 120, 120),
         G.LandState.BUILDING:         (139, 69, 19),
     }.get(state, (0, 0, 0))
+    
 
 
 def _compute_bounds(world: G._WorldState) -> tuple[int, int]:

@@ -1,0 +1,14 @@
+{
+  "visible": {"condition": null},
+  "can_build": {"condition": null},
+  "can_destroy": {"condition": null},
+  "on_build": {"effect": [], "IFS": {}},
+  "on_destroy": {"effect": [], "IFS": {}},
+  "cost": 5000,
+  "floor_width": 5,
+  "floor_length": 5,
+  "floors": 1,
+  "loading_bays": 1,
+  "parking_spots": 2,
+  "building_type": {"name": "Factory"}
+}

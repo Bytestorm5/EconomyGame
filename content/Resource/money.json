@@ -1,0 +1,10 @@
+{
+  "id": "money",
+  "display_name": "Money",
+  "unit_name": "dollar",
+  "cost_per": 1,
+  "quality": 0,
+  "type": {"id": "currency"},
+  "market_behavior": "currency",
+  "fulfills_demand": {}
+}
