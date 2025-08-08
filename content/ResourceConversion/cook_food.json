@@ -1,0 +1,9 @@
+{
+  "id": "cook_food",
+  "display_name": "Cook Food",
+  "visible": {"condition": null},
+  "parent": null,
+  "input_resources": {"raw_food": 1},
+  "output_resources": {"food": 1},
+  "default_time_taken": 1
+}

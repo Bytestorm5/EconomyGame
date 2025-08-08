@@ -1,0 +1,10 @@
+{
+  "id": "shares",
+  "display_name": "Shares",
+  "unit_name": "share",
+  "cost_per": 1,
+  "quality": 0,
+  "type": {"id": "security"},
+  "market_behavior": "equity",
+  "fulfills_demand": {"investment": 1}
+}

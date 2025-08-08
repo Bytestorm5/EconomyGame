@@ -1,0 +1,10 @@
+{
+  "id": "convenience_food",
+  "display_name": "Convenience Food",
+  "unit_name": "meal",
+  "cost_per": 8,
+  "quality": 2,
+  "type": {"id": "solid"},
+  "market_behavior": "commodity",
+  "fulfills_demand": {"hunger": 1.2}
+}

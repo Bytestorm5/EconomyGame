@@ -1,0 +1,9 @@
+{
+  "id": "farm_raw_food",
+  "display_name": "Farm Raw Food",
+  "visible": {"condition": null},
+  "parent": null,
+  "input_resources": {},
+  "output_resources": {"raw_food": 1},
+  "default_time_taken": 2
+}

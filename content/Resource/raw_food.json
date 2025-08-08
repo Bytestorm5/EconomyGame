@@ -1,0 +1,10 @@
+{
+  "id": "raw_food",
+  "display_name": "Raw Food",
+  "unit_name": "unit",
+  "cost_per": 2,
+  "quality": 0.5,
+  "type": {"id": "solid"},
+  "market_behavior": "commodity",
+  "fulfills_demand": {}
+}

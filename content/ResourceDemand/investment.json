@@ -1,0 +1,8 @@
+{
+  "id": "investment",
+  "is_need": false,
+  "quantity": 1,
+  "min_time_until_repeat": null,
+  "demand_can_occur": null,
+  "chance_per_tick": 0.0
+}

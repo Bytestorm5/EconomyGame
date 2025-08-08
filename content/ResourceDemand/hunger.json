@@ -1,0 +1,8 @@
+{
+  "id": "hunger",
+  "is_need": true,
+  "quantity": 1,
+  "min_time_until_repeat": 6,
+  "demand_can_occur": null,
+  "chance_per_tick": 0.2
+}

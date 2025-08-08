@@ -1,0 +1,10 @@
+{
+  "id": "food",
+  "display_name": "Food",
+  "unit_name": "meal",
+  "cost_per": 5,
+  "quality": 1,
+  "type": {"id": "solid"},
+  "market_behavior": "commodity",
+  "fulfills_demand": {"hunger": 1.0}
+}

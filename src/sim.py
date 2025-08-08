@@ -182,18 +182,19 @@ class Market:
             (o for o in self.order_book.orders if o.side == "buy" and o.timestamp == tick),
             key=lambda o: (-o.limit_price, o.timestamp)
         )
-        all_sells = [o for o in self.order_book.orders if o.side == "sell" and o.timestamp == tick]        
+        all_sells = [o for o in self.order_book.orders if o.side == "sell" and o.timestamp == tick]
         trades: List[Tuple[Order, Order, Decimal, Decimal]] = []
         for buy in buys:
             known_actors = []
             if buy.actor_id in world.companies:
-                known_actors =  world.companies[buy.actor_id].known_actors
+                known_actors = world.companies[buy.actor_id].known_actors
             else:
-                known_actors =  world.population[buy.actor_id].known_actors
-            # Limit this buyer's market to sellers that they know about
+                known_actors = world.population[buy.actor_id].known_actors
+
+            # Sort sellers by total unit cost (ask + shipping), among known actors
             sells = sorted(
                 [s for s in all_sells if s.actor_id in known_actors],
-                key=lambda o: (self.get_effective_price(buy, o.actor_id), o.timestamp)
+                key=lambda s: (self.total_unit_cost_for_match(buy, s), s.timestamp)
             )
             for sell in sells:
                 if buy.resource_id != sell.resource_id or buy.quantity <= 0 or sell.quantity <= 0:
@@ -204,15 +205,18 @@ class Market:
                     trades.append((buy, sell, price, trade_qty))
                     buy.quantity -= trade_qty
                     sell.quantity -= trade_qty
-                    # share knowledge of trading partner
+
+                    # Share knowledge of counterparty
                     buyer = world.companies.get(buy.actor_id) if buy.actor_type == 'company' else world.population.get(buy.actor_id)
                     seller = world.companies.get(sell.actor_id) if sell.actor_type == 'company' else world.population.get(sell.actor_id)
                     if buyer and sell.actor_id not in buyer.known_actors:
                         buyer.known_actors.append(sell.actor_id)
                     if seller and buy.actor_id not in seller.known_actors:
                         seller.known_actors.append(buy.actor_id)
+
         self.order_book.orders = [o for o in self.order_book.orders if o.quantity > 0]
         return trades
+
     
     def update_prices(self, world: G._WorldState, tick: int, rng: random.Random) -> None:
         """
@@ -278,24 +282,24 @@ class Market:
             
         self.prev_price = self.price
         for buy, sell, price, qty in trades:
-            # Buy Side
+            # Buy side credit/debit
             if buy.actor_type == 'company':
-                comp = world.companies.get(buy.actor_id)
+                comp_buyer = world.companies.get(buy.actor_id)
             else:
-                comp = world.population.get(buy.actor_id)
-            if comp:
-                comp.resources[buy.resource_id] = comp.resources.get(buy.resource_id, Decimal(0)) + qty
-                comp.resources['money'] = comp.resources.get('money', Decimal(0)) - price * qty
+                comp_buyer = world.population.get(buy.actor_id)
+            if comp_buyer:
+                comp_buyer.resources[buy.resource_id] = comp_buyer.resources.get(buy.resource_id, Decimal(0)) + qty
+                comp_buyer.resources['money'] = comp_buyer.resources.get('money', Decimal(0)) - price * qty
             self.price = price
-            
-            # Sell Side
+
+            # Sell side credit/debit (FIX: use sell.actor_id, not buy.actor_id)
             if sell.actor_type == 'company':
-                comp = world.companies.get(buy.actor_id)
+                comp_seller = world.companies.get(sell.actor_id)
             else:
-                comp = world.population.get(buy.actor_id)
-            if comp:
-                comp.resources[sell.resource_id] = comp.resources.get(sell.resource_id, Decimal(0)) - qty
-                comp.resources['money'] = comp.resources.get('money', Decimal(0)) + price * qty
+                comp_seller = world.population.get(sell.actor_id)
+            if comp_seller:
+                comp_seller.resources[sell.resource_id] = comp_seller.resources.get(sell.resource_id, Decimal(0)) - qty
+                comp_seller.resources['money'] = comp_seller.resources.get('money', Decimal(0)) + price * qty
             self.price = price
     
     # def get_available_supply(self, actor_type: str) -> Decimal:
@@ -372,6 +376,13 @@ class Market:
         shipping = self.estimate_shipping_cost(order.actor_id, order.quantity, supplier_id)
         return base_price + shipping
 
+    def total_unit_cost_for_match(self, buy: Order, sell: Order) -> Decimal:
+        """
+        Total per-unit cost a buyer faces for a specific sell order, including shipping.
+        """
+        shipping = self.estimate_shipping_cost(buy.actor_id, min(buy.quantity, sell.quantity), sell.actor_id)
+        return sell.limit_price + shipping
+
 # -----------------------------------
 # AI Behavior Hooks
 # -----------------------------------
@@ -419,12 +430,21 @@ class CompanyBehavior(Behavior):
     def __init__(self) -> None:
         """Placeholder constructor; kept for future expansion."""
 
-    _LR            = 0.25      # learning-rate toward market
-    _NOISE_SCALE   = 0.02      # ±2 % random observation error
-    _THRESHOLD_PCT = Decimal("0.03")   # 3 % mis-pricing before acting
-    _SPEC_FRAC     = Decimal("0.30")   # deploy up to 30 % of cash / stock
+    _LR            = 0.25
+    _NOISE_SCALE   = 0.02
+    _THRESHOLD_PCT = Decimal("0.03")
+    _SPEC_FRAC     = Decimal("0.30")
+    _UNDERCUT_PCT  = Decimal("0.01")  # Compete on price by undercutting best ask by 1%
+    _SELL_BUFFER   = Decimal("5")     # Keep some buffer, sell above this
+    _BUILD_BUFFER  = Decimal("20")
+
 
     # ── Internal helpers ─────────────────────────────────────────────────────
+    def _compute_unit_economics(self, conv, markets) -> Decimal:
+        revenue = sum(markets[rid].price * amt for rid, amt in conv.output_resources.items())
+        cost    = sum(markets[rid].price * amt for rid, amt in conv.input_resources.items())
+        return revenue - cost
+    
     def _find_best_conversion(self, markets: Dict[str, Market]) -> Optional[G.ResourceConversion]:
         best_conv: Optional[G.ResourceConversion] = None
         best_profit = Decimal("0")
@@ -493,61 +513,196 @@ class CompanyBehavior(Behavior):
             )
         )
 
-    # ── Main behaviour ──────────────────────────────────────────────────────
+    def _best_competitor_ask(self, mkt: Market, tick: int, exclude_company_id: int) -> Optional[Decimal]:
+        asks = [
+            o.limit_price for o in mkt.order_book.orders
+            if o.side == 'sell' and o.timestamp == tick and (o.actor_id != exclude_company_id)
+        ]
+        return min(asks) if asks else None
+
+    def _try_build_capacity(self, comp, world, markets) -> None:
+        profitable = [conv for conv in ConvDefs.values() if self._compute_unit_economics(conv, markets) > 0]
+        if not profitable:
+            return
+        conv = profitable[0]
+
+        input_backlog = sum(comp.resources.get(rid, Decimal(0)) for rid in conv.input_resources.keys())
+        if input_backlog < self._BUILD_BUFFER:
+            return
+
+        bdefs = REGISTRY.get("BuildingDefinition", {})  # pick first available
+        if not bdefs:
+            return
+        bdef = next(iter(bdefs.values()))
+        cost = bdef.cost
+        cash = comp.resources.get("money", Decimal(0))
+        if cash < cost:
+            return
+
+        free = [p for p in world.land.values() if p.state_id == G.LandState.WILD_BUILDABLE and p.building_id is None]
+        if not free:
+            return
+        parcel = random.choice(free)
+
+        binst = G._BuildingInstance(
+            land_parcel_id=0,
+            definition=bdef,
+            owner_company_id=str(comp.instance_id),
+            units={},
+            loading_bay_occupants=[],
+            parking_occupants=[],
+        )
+        world.buildings[binst.instance_id] = binst
+        parcel.state_id = G.LandState.BUILDING
+        parcel.building_id = str(binst.instance_id)
+        comp.buildings.append(binst.instance_id)
+        comp.resources["money"] = cash - cost
+
+        mdefs = REGISTRY.get("MachineDefinition", {})
+        if mdefs:
+            mdef = mdefs.get("cooker") or next(iter(mdefs.values()))
+            unit = G._UnitInstance(owner_company_id=str(comp.instance_id), floor_space=bdef.floor_area)
+            binst.add_unit(unit)
+            unit.add_machine(mdef, active=True)
+            # set recipe if compatible
+            if unit.machines:
+                unit.machines[-1].recipe = "cook_food"
+
+        vdefs = REGISTRY.get("VehicleDefinition", {})
+        if vdefs and not any(v.owner_company_id == comp.instance_id for v in world.vehicles.values()):
+            vdef = next(iter(vdefs.values()))
+            v = G._VehicleInstance(
+                vehicle_type=vdef,
+                owner_company_id=comp.instance_id,
+                position=parcel.pos_tuple(),
+                destination=None,
+                status='idle',
+                inventory=G._Inventory(capacity=int(vdef.cargo_inventory_size)),
+                fuel_stored=Decimal(10)
+            )
+            world.vehicles[v.instance_id] = v
+    
+    def _list_inventory_for_sale(self, comp: G._CompanyInstance, markets: Dict[str, Market], rng: random.Random, tick: int) -> None:
+        # Proactively sell inventory with competitive pricing
+        for rid, qty in list(comp.resources.items()):
+            if rid in ("money", "shares"):
+                continue
+            if qty <= self._SELL_BUFFER:
+                continue
+            mkt = markets[rid]
+            fv = _update_fair_value(comp, rid, mkt.volume_weighted_price, rng, self._LR, self._NOISE_SCALE)
+            best_ask = self._best_competitor_ask(mkt, tick, comp.instance_id)
+            target_price = fv if best_ask is None else min(fv, best_ask * (Decimal("1") - self._UNDERCUT_PCT))
+            sell_qty = (qty - self._SELL_BUFFER) * self._SPEC_FRAC
+            sell_qty = sell_qty.quantize(Decimal("1."))
+            if sell_qty > 0:
+                mkt.order_book.submit(Order(
+                    actor_type="company",
+                    actor_id=comp.instance_id,
+                    resource_id=rid,
+                    quantity=sell_qty,
+                    limit_price=target_price,
+                    side="sell",
+                    timestamp=tick,
+                ))
+
+    def _plan_cycles(self, conv: G.ResourceConversion, markets: Dict[str, Market], cash: Decimal) -> int:
+        # Expand “scale” by planning multiple profitable cycles
+        inputs_cost = sum(markets[rid].price * amt for rid, amt in conv.input_resources.items())
+        if inputs_cost <= 0:
+            return 0
+        budget = cash * self._SPEC_FRAC
+        max_cycles = int((budget / inputs_cost).quantize(Decimal("1.")))
+        return max(0, max_cycles)
+
+    def _ensure_marketing(self, comp: G._CompanyInstance, marketing: MarketingMarket, tick: int) -> None:
+        # Spend lightly on marketing when holding inventory to increase reach/known_actors
+        inventory_pressure = sum(q for rid, q in comp.resources.items() if rid not in ("money", "shares"))
+        cash = comp.resources.get("money", Decimal(0))
+        if inventory_pressure > self._SELL_BUFFER and cash > 10:
+            qty = int(min(10, float(inventory_pressure)))
+            spend = min(Decimal(qty) * marketing.price, cash * Decimal("0.05"))
+            if spend > 0:
+                marketing.submit(MarketingOrder(company_id=comp.instance_id, quantity=qty, limit_price=marketing.price, timestamp=tick))
+                comp.resources["money"] = cash - spend
+
     def tick(self, world, markets, marketing, tick, rng):
         for comp in world.companies.values():
             conv = self._find_best_conversion(markets)
             if conv is not None:
+                # Expand by scaling profitable production
+                cash = comp.resources.get("money", Decimal(0))
+                target_cycles = self._plan_cycles(conv, markets, cash)
                 for rid, amt in conv.input_resources.items():
-                    self._acquire_resource(comp, rid, amt, markets, tick)
-                if all(comp.resources.get(rid, Decimal(0)) >= amt for rid, amt in conv.input_resources.items()):
+                    self._acquire_resource(comp, rid, amt * Decimal(target_cycles or 1), markets, tick)
+
+                # Execute as many cycles as current inventories allow
+                can_loop = True
+                loop_guard = 0
+                while can_loop and loop_guard < max(1, target_cycles):
+                    loop_guard += 1
+                    can_run = all(comp.resources.get(rid, Decimal(0)) >= amt for rid, amt in conv.input_resources.items())
+                    if not can_run:
+                        break
                     for rid, amt in conv.input_resources.items():
                         comp.resources[rid] -= amt
                     for rid, amt in conv.output_resources.items():
                         comp.resources[rid] = comp.resources.get(rid, Decimal(0)) + amt
                         mkt = markets[rid]
-                        fv = _update_fair_value(
-                            comp, rid, mkt.volume_weighted_price, rng, self._LR, self._NOISE_SCALE
-                        )
-                        mkt.order_book.submit(
-                            Order(
-                                actor_type="company",
-                                actor_id=comp.instance_id,
-                                resource_id=rid,
-                                quantity=amt,
-                                limit_price=fv,
-                                side="sell",
-                                timestamp=tick,
-                            )
-                        )
+                        fv = _update_fair_value(comp, rid, mkt.volume_weighted_price, rng, self._LR, self._NOISE_SCALE)
+                        # Compete by undercutting current best ask, within reason
+                        best_ask = self._best_competitor_ask(mkt, tick, comp.instance_id)
+                        ask_price = fv if best_ask is None else min(fv, best_ask * (Decimal("1") - self._UNDERCUT_PCT))
+                        mkt.order_book.submit(Order(
+                            actor_type="company",
+                            actor_id=comp.instance_id,
+                            resource_id=rid,
+                            quantity=amt,
+                            limit_price=ask_price,
+                            side="sell",
+                            timestamp=tick,
+                        ))
 
+            # Existing light speculation and rebalancing (unchanged)
             cash = comp.resources.get("money", Decimal(0))
             for rid, mkt in markets.items():
-                fv = _update_fair_value(comp, rid, mkt.volume_weighted_price, rng,
-                                        self._LR, self._NOISE_SCALE)
+                fv = _update_fair_value(comp, rid, mkt.volume_weighted_price, rng, self._LR, self._NOISE_SCALE)
                 mis_pct = (fv - mkt.price) / mkt.price
                 if mis_pct > self._THRESHOLD_PCT and cash > 0:
-                    budget   = cash * self._SPEC_FRAC
-                    qty      = (budget / mkt.price).quantize(Decimal("1."))
+                    budget = cash * self._SPEC_FRAC
+                    qty = (budget / mkt.price).quantize(Decimal("1."))
                     if qty > 0:
-                        mkt.order_book.submit(Order(actor_type="company",
-                                                    actor_id=comp.instance_id,
-                                                    resource_id=rid,
-                                                    quantity=qty,
-                                                    limit_price=fv,
-                                                    side="buy",
-                                                    timestamp=tick))
+                        mkt.order_book.submit(Order(
+                            actor_type="company",
+                            actor_id=comp.instance_id,
+                            resource_id=rid,
+                            quantity=qty,
+                            limit_price=fv,
+                            side="buy",
+                            timestamp=tick
+                        ))
                 elif mis_pct < -self._THRESHOLD_PCT:
                     stock = comp.resources.get(rid, Decimal(0))
-                    qty   = (stock * self._SPEC_FRAC).quantize(Decimal("1."))
+                    qty = (stock * self._SPEC_FRAC).quantize(Decimal("1."))
                     if qty > 0:
-                        mkt.order_book.submit(Order(actor_type="company",
-                                                    actor_id=comp.instance_id,
-                                                    resource_id=rid,
-                                                    quantity=qty,
-                                                    limit_price=fv,
-                                                    side="sell",
-                                                    timestamp=tick))
+                        mkt.order_book.submit(Order(
+                            actor_type="company",
+                            actor_id=comp.instance_id,
+                            resource_id=rid,
+                            quantity=qty,
+                            limit_price=fv,
+                            side="sell",
+                            timestamp=tick
+                        ))
+                        
+            try:
+                self._try_build_capacity(comp, world, markets)
+            except Exception:
+                pass
+
+            # New: actively sell and market when holding inventory
+            self._list_inventory_for_sale(comp, markets, rng, tick)
+            self._ensure_marketing(comp, marketing, tick)
 
 class PersonBehavior(Behavior):
     def __init__(self) -> None:

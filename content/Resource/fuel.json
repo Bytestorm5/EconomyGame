@@ -1,0 +1,10 @@
+{
+  "id": "fuel",
+  "display_name": "Fuel",
+  "unit_name": "gallon",
+  "cost_per": 3,
+  "quality": 0,
+  "type": {"id": "liquid"},
+  "market_behavior": "commodity",
+  "fulfills_demand": {}
+}
