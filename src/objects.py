@@ -515,19 +515,32 @@ class _FinancialEntityInstance(BaseModel):
             total += price * qty
         return total
 
+class BusinessPersonality(BaseModel):
+    """High level traits that guide company decision making."""
+
+    risk_tolerance: float = 0.5     # willingness to operate at a loss
+    marketing_focus: float = 0.5     # how much budget goes to marketing
+    price_competitiveness: float = 0.5  # desire to undercut competitors
+    patience: int = 24              # max ticks to remain unprofitable
+    expansionism: float = 0.5        # tendency to seek new products
+
+
 class _CompanyInstance(_FinancialEntityInstance):
     techs: List[str] = Field(default_factory=list)
     # Resources this company is irrationally attached to producing
     focus_resources: List[str] = Field(default_factory=list)
     # Planning horizon expressed in ticks (1 tick == 1 real hour)
     planning_horizon: int = 24
+    personality: BusinessPersonality = Field(default_factory=BusinessPersonality)
+    # mapping of conversion id -> consecutive ticks unprofitable
+    active_conversions: Dict[str, int] = Field(default_factory=dict)
 
 # Simple resource‑conversion recipe (updated to reference machine *IDs*)
 class ResourceConversion(BaseModel):
     id: str
     display_name: str
     visible: ConditionBlock
-    parent: ResourceConversion
+    parent: Optional["ResourceConversion"] = None
     input_resources: _ResourceAmounts
     output_resources: _ResourceAmounts
     default_time_taken: Decimal = Field(default_factory=lambda: Decimal(0))
@@ -535,6 +548,8 @@ class ResourceConversion(BaseModel):
     @validator("input_resources", "output_resources", pre=True)
     def _decimize_map(cls, v):  # noqa: N805
         return {k: Decimal(str(val)) for k, val in v.items()}
+
+ResourceConversion.model_rebuild()
 
 # ────────────────────────────────────────────────────────────────────────────
 # Individuals
@@ -605,7 +620,7 @@ class Personality(BaseModel):
     
 class _PersonInstance(_FinancialEntityInstance):
     education: Optional[EducationCategory] = None
-    
+
     # Dictionary of PersonInstance to a 0-1 chance that they will share information with that Person
     personal_relationship: dict[int, float]
 
@@ -616,6 +631,10 @@ class _PersonInstance(_FinancialEntityInstance):
     inventory: _Inventory
 
     personality: Personality = Field(default_factory=Personality)
+    # Loyalty to companies (0-1) built through marketing and good experiences
+    brand_loyalty: Dict[int, float] = Field(default_factory=dict)
+    # Intrinsic preference for resources (0-1) used when fulfilling demands
+    resource_preferences: Dict[str, float] = Field(default_factory=dict)
 
     # Active demands that this person is currently trying to satisfy
     active_demands: Dict[str, int] = Field(default_factory=dict)
@@ -638,3 +657,57 @@ class _WorldState(BaseModel):
     jobs: Dict[int, _JobSlot] = Field(default_factory=dict)
 
     # ── Helper methods -----------------------------------------------------
+    def post_job(self, company_id: int, role: JobRole, wage: Decimal) -> int:
+        """Create a job posting for a company and return the job id."""
+        slot = _JobSlot(role=role)
+        self.jobs[slot.instance_id] = slot
+        comp = self.companies.get(company_id)
+        if comp:
+            comp.known_actors.append(slot.instance_id)
+        return slot.instance_id
+
+    def transfer_unit(self, building_id: int, unit_id: int, new_owner: str, price: Decimal) -> None:
+        """Sell a unit to another company, transferring ownership and cash."""
+        building = self.buildings[building_id]
+        unit = building.units[unit_id]
+        if unit.owner_company_id == new_owner:
+            return
+        seller = self.companies.get(int(unit.owner_company_id))
+        buyer = self.companies.get(int(new_owner))
+        if seller and buyer and buyer.resources.get("money", Decimal(0)) >= price:
+            buyer.resources["money"] -= price
+            seller.resources["money"] = seller.resources.get("money", Decimal(0)) + price
+            unit.owner_company_id = new_owner
+
+    def rent_unit(self, building_id: int, unit_id: int, renter: str, rent_price: Decimal) -> None:
+        """Assign a renter to the unit at a given rent per tick."""
+        building = self.buildings[building_id]
+        unit = building.units[unit_id]
+        unit.rent_price_per_tick = rent_price
+        if renter not in unit.access_team_ids:
+            unit.access_team_ids.append(renter)
+
+    def split_unit(self, building_id: int, unit_id: int, new_space: int) -> Optional[int]:
+        """Split a unit, creating a new one with `new_space` floor area."""
+        building = self.buildings[building_id]
+        unit = building.units[unit_id]
+        if new_space >= unit.floor_space:
+            return None
+        unit.floor_space -= new_space
+        new_unit = _UnitInstance(owner_company_id=unit.owner_company_id, floor_space=new_space)
+        building.units[new_unit.instance_id] = new_unit
+        return new_unit.instance_id
+
+    def merge_units(self, building_id: int, unit_a: int, unit_b: int) -> Optional[int]:
+        """Merge two units owned by the same company."""
+        building = self.buildings[building_id]
+        ua = building.units[unit_a]
+        ub = building.units[unit_b]
+        if ua.owner_company_id != ub.owner_company_id:
+            return None
+        merged_space = ua.floor_space + ub.floor_space
+        new_unit = _UnitInstance(owner_company_id=ua.owner_company_id, floor_space=merged_space)
+        building.units[new_unit.instance_id] = new_unit
+        del building.units[unit_a]
+        del building.units[unit_b]
+        return new_unit.instance_id

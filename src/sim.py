@@ -121,16 +121,20 @@ class MarketingMarket:
 
     def _apply_impression(self, person: G._PersonInstance, company_id: int, rng: random.Random) -> None:
         roll = rng.random()
-        if roll < 0.15 * person.personality.marketing_susceptibility:
+        sus = person.personality.marketing_susceptibility
+        if roll < 0.15 * sus:
             if company_id not in person.known_actors:
                 person.known_actors.append(company_id)
-        elif roll < 0.20 * person.personality.marketing_susceptibility:
+            person.brand_loyalty[company_id] = min(1.0, person.brand_loyalty.get(company_id, 0.0) + 0.05 * sus)
+        elif roll < 0.20 * sus:
             if company_id not in person.known_actors:
                 person.known_actors.append(company_id)
+            person.brand_loyalty[company_id] = min(1.0, person.brand_loyalty.get(company_id, 0.0) + 0.10 * sus)
             self._share_information(person, company_id, rng)
         elif roll > 0.98:
             if company_id in person.known_actors:
                 person.known_actors.remove(company_id)
+            person.brand_loyalty[company_id] = max(0.0, person.brand_loyalty.get(company_id, 0.0) - 0.20)
             self._share_information(person, company_id, rng, negative=True)
 
     def _share_information(self, person: G._PersonInstance, company_id: int, rng: random.Random, negative: bool = False) -> None:
@@ -142,9 +146,11 @@ class MarketingMarket:
                 if negative:
                     if company_id in other.known_actors:
                         other.known_actors.remove(company_id)
+                    other.brand_loyalty[company_id] = max(0.0, other.brand_loyalty.get(company_id, 0.0) - 0.10 * rel)
                 else:
                     if company_id not in other.known_actors:
                         other.known_actors.append(company_id)
+                    other.brand_loyalty[company_id] = min(1.0, other.brand_loyalty.get(company_id, 0.0) + 0.05 * rel)
 
 # -----------------------------------
 # Market (Single Resource)
@@ -191,11 +197,23 @@ class Market:
             else:
                 known_actors = world.population[buy.actor_id].known_actors
 
-            # Sort sellers by total unit cost (ask + shipping), among known actors
-            sells = sorted(
-                [s for s in all_sells if s.actor_id in known_actors],
-                key=lambda s: (self.total_unit_cost_for_match(buy, s), s.timestamp)
-            )
+            # Sort sellers by total unit cost (ask + shipping) adjusted by loyalty
+            if buy.actor_type == "person":
+                buyer = world.population.get(buy.actor_id)
+                sells = sorted(
+                    [s for s in all_sells if s.actor_id in known_actors],
+                    key=lambda s: (
+                        self.total_unit_cost_for_match(buy, s)
+                        * (1 - buyer.brand_loyalty.get(s.actor_id, 0.0))
+                        if buyer else self.total_unit_cost_for_match(buy, s),
+                        s.timestamp,
+                    )
+                )
+            else:
+                sells = sorted(
+                    [s for s in all_sells if s.actor_id in known_actors],
+                    key=lambda s: (self.total_unit_cost_for_match(buy, s), s.timestamp)
+                )
             for sell in sells:
                 if buy.resource_id != sell.resource_id or buy.quantity <= 0 or sell.quantity <= 0:
                     continue
@@ -300,6 +318,11 @@ class Market:
             if comp_seller:
                 comp_seller.resources[sell.resource_id] = comp_seller.resources.get(sell.resource_id, Decimal(0)) - qty
                 comp_seller.resources['money'] = comp_seller.resources.get('money', Decimal(0)) + price * qty
+            # update loyalty for buyer if person purchasing from company
+            if buy.actor_type == 'person' and sell.actor_type == 'company':
+                person = world.population.get(buy.actor_id)
+                if person:
+                    person.brand_loyalty[sell.actor_id] = min(1.0, person.brand_loyalty.get(sell.actor_id, 0.0) + 0.1)
             self.price = price
     
     # def get_available_supply(self, actor_type: str) -> Decimal:
@@ -592,8 +615,9 @@ class CompanyBehavior(Behavior):
             mkt = markets[rid]
             fv = _update_fair_value(comp, rid, mkt.volume_weighted_price, rng, self._LR, self._NOISE_SCALE)
             best_ask = self._best_competitor_ask(mkt, tick, comp.instance_id)
-            target_price = fv if best_ask is None else min(fv, best_ask * (Decimal("1") - self._UNDERCUT_PCT))
-            sell_qty = (qty - self._SELL_BUFFER) * self._SPEC_FRAC
+            undercut = self._UNDERCUT_PCT * Decimal(str(comp.personality.price_competitiveness))
+            target_price = fv if best_ask is None else min(fv, best_ask * (Decimal("1") - undercut))
+            sell_qty = (qty - self._SELL_BUFFER) * self._SPEC_FRAC * Decimal(str(comp.personality.risk_tolerance + 0.5))
             sell_qty = sell_qty.quantize(Decimal("1."))
             if sell_qty > 0:
                 mkt.order_book.submit(Order(
@@ -621,22 +645,42 @@ class CompanyBehavior(Behavior):
         cash = comp.resources.get("money", Decimal(0))
         if inventory_pressure > self._SELL_BUFFER and cash > 10:
             qty = int(min(10, float(inventory_pressure)))
-            spend = min(Decimal(qty) * marketing.price, cash * Decimal("0.05"))
+            spend_cap = cash * Decimal(str(0.05 * comp.personality.marketing_focus))
+            spend = min(Decimal(qty) * marketing.price, spend_cap)
             if spend > 0:
                 marketing.submit(MarketingOrder(company_id=comp.instance_id, quantity=qty, limit_price=marketing.price, timestamp=tick))
                 comp.resources["money"] = cash - spend
 
     def tick(self, world, markets, marketing, tick, rng):
         for comp in world.companies.values():
-            conv = self._find_best_conversion(markets)
-            if conv is not None:
-                # Expand by scaling profitable production
+            # maintain active conversions and drop unprofitable ones
+            for cid in list(comp.active_conversions.keys()):
+                conv = ConvDefs.get(cid)
+                if not conv:
+                    del comp.active_conversions[cid]
+                    continue
+                profit = self._compute_unit_economics(conv, markets)
+                if profit <= 0:
+                    comp.active_conversions[cid] += 1
+                    if comp.active_conversions[cid] > comp.personality.patience:
+                        del comp.active_conversions[cid]
+                else:
+                    comp.active_conversions[cid] = 0
+
+            if not comp.active_conversions or rng.random() < comp.personality.expansionism:
+                conv = self._find_best_conversion(markets)
+                if conv and conv.id not in comp.active_conversions:
+                    comp.active_conversions[conv.id] = 0
+
+            for conv_id in list(comp.active_conversions.keys()):
+                conv = ConvDefs.get(conv_id)
+                if not conv:
+                    continue
                 cash = comp.resources.get("money", Decimal(0))
                 target_cycles = self._plan_cycles(conv, markets, cash)
                 for rid, amt in conv.input_resources.items():
                     self._acquire_resource(comp, rid, amt * Decimal(target_cycles or 1), markets, tick)
 
-                # Execute as many cycles as current inventories allow
                 can_loop = True
                 loop_guard = 0
                 while can_loop and loop_guard < max(1, target_cycles):
@@ -650,9 +694,9 @@ class CompanyBehavior(Behavior):
                         comp.resources[rid] = comp.resources.get(rid, Decimal(0)) + amt
                         mkt = markets[rid]
                         fv = _update_fair_value(comp, rid, mkt.volume_weighted_price, rng, self._LR, self._NOISE_SCALE)
-                        # Compete by undercutting current best ask, within reason
                         best_ask = self._best_competitor_ask(mkt, tick, comp.instance_id)
-                        ask_price = fv if best_ask is None else min(fv, best_ask * (Decimal("1") - self._UNDERCUT_PCT))
+                        undercut = self._UNDERCUT_PCT * Decimal(str(comp.personality.price_competitiveness))
+                        ask_price = fv if best_ask is None else min(fv, best_ask * (Decimal("1") - undercut))
                         mkt.order_book.submit(Order(
                             actor_type="company",
                             actor_id=comp.instance_id,
@@ -665,11 +709,12 @@ class CompanyBehavior(Behavior):
 
             # Existing light speculation and rebalancing (unchanged)
             cash = comp.resources.get("money", Decimal(0))
+            spec_frac = self._SPEC_FRAC * Decimal(str(comp.personality.risk_tolerance + 0.5))
             for rid, mkt in markets.items():
                 fv = _update_fair_value(comp, rid, mkt.volume_weighted_price, rng, self._LR, self._NOISE_SCALE)
                 mis_pct = (fv - mkt.price) / mkt.price
                 if mis_pct > self._THRESHOLD_PCT and cash > 0:
-                    budget = cash * self._SPEC_FRAC
+                    budget = cash * spec_frac
                     qty = (budget / mkt.price).quantize(Decimal("1."))
                     if qty > 0:
                         mkt.order_book.submit(Order(
@@ -683,7 +728,7 @@ class CompanyBehavior(Behavior):
                         ))
                 elif mis_pct < -self._THRESHOLD_PCT:
                     stock = comp.resources.get(rid, Decimal(0))
-                    qty = (stock * self._SPEC_FRAC).quantize(Decimal("1."))
+                    qty = (stock * spec_frac).quantize(Decimal("1."))
                     if qty > 0:
                         mkt.order_book.submit(Order(
                             actor_type="company",
@@ -716,6 +761,13 @@ class PersonBehavior(Behavior):
     def tick(self, world, markets, marketing, tick, rng):
         for p in world.population.values():
             cash = p.resources.get("money", Decimal(0))
+            # initialise preferences once
+            if not p.resource_preferences:
+                for rid in ResourceDefs.keys():
+                    p.resource_preferences[rid] = rng.random()
+            # loyalty decay
+            for cid in list(p.brand_loyalty.keys()):
+                p.brand_loyalty[cid] *= 0.99
             # surface new demands – chance influenced by personality
             for demand in DemandDefs.values():
                 if demand.id in p.active_demands:
@@ -762,7 +814,14 @@ class PersonBehavior(Behavior):
                 options = [res for res in ResourceDefs.values() if d_id in res.fulfills_demand]
                 if not options:
                     continue
-                res = min(options, key=lambda r: markets[r.id].price / Decimal(str(r.fulfills_demand[d_id])))
+                res = min(
+                    options,
+                    key=lambda r: (
+                        markets[r.id].price
+                        / Decimal(str(r.fulfills_demand[d_id]))
+                    )
+                    / (p.resource_preferences.get(r.id, 0.5) + 0.5),
+                )
                 limit = markets[res.id].price
                 if cash >= limit * qty:
                     markets[res.id].order_book.submit(Order(
