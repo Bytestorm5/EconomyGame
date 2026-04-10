@@ -48,7 +48,7 @@ def main():
             with open(schema_file, "w", encoding="utf-8") as f:
                 json.dump(schema_dict, f, indent=2)
 
-            print(f"✔ Wrote schema for '{name}' to {schema_file}")
+            print(f"[OK] Wrote schema for '{name}' to {schema_file}")
 
 
 if __name__ == "__main__":
