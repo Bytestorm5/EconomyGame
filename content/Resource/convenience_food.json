@@ -4,7 +4,13 @@
   "unit_name": "meal",
   "cost_per": 8,
   "quality": 2,
-  "type": {"id": "solid"},
+  "type": {
+    "id": "solid"
+  },
   "market_behavior": "commodity",
-  "fulfills_demand": {"hunger": 1.2}
+  "fulfills_demand": {
+    "hunger": 1.2,
+    "comfort": 1.0
+  },
+  "expires_in": 21600
 }

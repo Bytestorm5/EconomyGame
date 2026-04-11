@@ -9,8 +9,10 @@
   "consumes_active": {},
   "inventory_capacity": 20,
   "inventory_resource_type": {"id": "solid"},
-  "conveyor_in_capacity": 0,
-  "conveyor_out_capacity": 0,
+  "conveyor_in_capacity": 1,
+  "conveyor_out_capacity": 1,
   "change_recipe_cost": {},
-  "possible_recipes": {"cook_food": 1}
+  "possible_recipes": {"cook_food": 1},
+  "input_ports": [{"port_id": "input_raw_food", "local_x": 0, "local_y": 0, "face": "west", "resource_ids": ["raw_food"]}],
+  "output_ports": [{"port_id": "output_food", "local_x": 0, "local_y": 0, "face": "east", "resource_ids": ["food", "convenience_food"]}]
 }

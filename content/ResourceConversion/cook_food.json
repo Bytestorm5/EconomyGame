@@ -5,5 +5,6 @@
   "parent": null,
   "input_resources": {"raw_food": 1},
   "output_resources": {"food": 1},
-  "default_time_taken": 1
+  "default_time_taken": 1,
+  "domain": "food_processing"
 }

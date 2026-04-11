@@ -10,7 +10,9 @@
   "inventory_capacity": 20,
   "inventory_resource_type": {"id": "solid"},
   "conveyor_in_capacity": 0,
-  "conveyor_out_capacity": 0,
+  "conveyor_out_capacity": 1,
   "change_recipe_cost": {},
-  "possible_recipes": {"farm_raw_food": 2}
+  "possible_recipes": {"farm_raw_food": 2},
+  "input_ports": [],
+  "output_ports": [{"port_id": "output_raw_food", "local_x": 0, "local_y": 0, "face": "east", "resource_ids": ["raw_food"]}]
 }

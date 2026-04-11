@@ -1,3 +1,6 @@
 venv/
 *__pycache__/
 content/meta*
+world_state.json
+/content
+*.md
