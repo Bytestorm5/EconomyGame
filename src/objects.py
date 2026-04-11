@@ -1,7 +1,7 @@
 from __future__ import annotations
 from decimal import Decimal
 from enum import Enum
-from typing import Any, Dict, List, Literal, Optional, Tuple
+from typing import Any, Dict, List, Literal, Optional, Tuple, Union
 from pydantic import BaseModel, Field, field_validator, model_validator, root_validator, validator
 from utils import age_decay
 
@@ -11,6 +11,28 @@ _id_counter = itertools.count()
 
 def get_instance_id():
     return next(_id_counter)
+
+# ----------------------------------------------------------------------------
+# Scriptable Object Mixin
+# ----------------------------------------------------------------------------
+
+JSONValue = Union[str, int, float, bool, None]
+
+
+class ScriptableObject(BaseModel):
+    """Mixin for objects that need per-mod scriptable state."""
+    mod_state: Dict[str, Dict[str, Any]] = Field(default_factory=dict)
+
+    def get_var(self, mod_id: str, key: str, default: Any = None) -> Any:
+        return self.mod_state.get(mod_id, {}).get(key, default)
+
+    def set_var(self, mod_id: str, key: str, value: JSONValue) -> None:
+        if not isinstance(value, (str, int, float, bool, type(None))):
+            raise ValueError(f"mod_state values must be JSON primitives, got {type(value)}")
+        if mod_id not in self.mod_state:
+            self.mod_state[mod_id] = {}
+        self.mod_state[mod_id][key] = value
+
 
 # ----------------------------------------------------------------------------
 # Utility: Condition / Effect (unchanged stubs - keep until DSL is defined)
@@ -421,7 +443,7 @@ class BuildingDefinition(BaseModel):
     def floor_area(self) -> int:
         return self.floor_width * self.floor_length
 
-class _BuildingInstance(BaseModel):
+class _BuildingInstance(ScriptableObject):
     """A concrete building that exists in game-world."""
 
     instance_id: int = Field(default_factory=get_instance_id)
@@ -627,7 +649,7 @@ class BusinessPersonality(BaseModel):
     logistics_focus: float = 0.5     # appetite for investment in logistics assets
 
 
-class _CompanyInstance(_FinancialEntityInstance):
+class _CompanyInstance(_FinancialEntityInstance, ScriptableObject):
     techs: List[str] = Field(default_factory=list)
     # Resources this company is irrationally attached to producing
     focus_resources: List[str] = Field(default_factory=list)
@@ -757,7 +779,7 @@ class Personality(BaseModel):
     risk_tolerance: float = 0.5    # 0-1, willingness to take financial risk
     adaptability: float = 0.5      # 0-1, base learning speed and openness to new domains
     
-class _PersonInstance(_FinancialEntityInstance):
+class _PersonInstance(_FinancialEntityInstance, ScriptableObject):
     age: float = 25.0
     education: Optional[EducationCategory] = None
 

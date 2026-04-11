@@ -12,6 +12,10 @@ import objects as G
 from objects import get_instance_id
 import bootstrap
 import tick_time
+# Ensure decorated API is loaded so registries are populated
+import game_api  # noqa: F401
+from dsl import EvalContext, evaluate_condition_block
+import actions  # noqa: F401 — registers scripting decorators on import
 # Constants
 WORLD_STATE_PATH = Path("world_state.json")
 ALL_SOURCES = [LOCAL_CONTENT] + MOD_PATHS
@@ -625,9 +629,19 @@ def _update_fair_value(agent: G._FinancialEntityInstance, resource_id: str, mark
     agent.fair_values[resource_id] = max(Decimal("0.01"), new_val)
     return new_val
 
-def evaluate_condition(cond: Optional[G.ConditionBlock], world: G._WorldState, person: Optional[G._PersonInstance] = None) -> bool:
-    # Placeholder for future DSL evaluation
-    return True
+def evaluate_condition(
+    cond: Optional[G.ConditionBlock],
+    world: G._WorldState,
+    person: Optional[G._PersonInstance] = None,
+    extra_scopes: Optional[Dict[str, object]] = None,
+) -> bool:
+    ctx = EvalContext(world=world)
+    base_scopes: Dict[str, object] = {}
+    if person is not None:
+        base_scopes["self"] = person
+    if extra_scopes:
+        base_scopes.update(extra_scopes)
+    return evaluate_condition_block(cond, ctx, base_scopes)
 
 # -----------------------------------
 # Persistence
