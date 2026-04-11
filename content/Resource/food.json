@@ -11,5 +11,6 @@
   "fulfills_demand": {
     "hunger": 1.0,
     "comfort": 0.5
-  }
+  },
+  "expires_in": 4320
 }

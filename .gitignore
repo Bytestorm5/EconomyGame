@@ -3,3 +3,4 @@ venv/
 content/meta*
 world_state.json
 /content
+*.md

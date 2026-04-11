@@ -3,6 +3,7 @@ from decimal import Decimal
 from enum import Enum
 from typing import Any, Dict, List, Literal, Optional, Tuple
 from pydantic import BaseModel, Field, field_validator, model_validator, root_validator, validator
+from utils import age_decay
 
 MAX_MANAGED_WORKERS = 8
 import itertools
@@ -15,7 +16,7 @@ def get_instance_id():
 # Utility: Condition / Effect (unchanged stubs - keep until DSL is defined)
 # ----------------------------------------------------------------------------
 
-_SimpleCond = str | Dict[str, str]
+_SimpleCond = Dict[str, str | int | float]
 
 class _AtCountParams(BaseModel):
     """Parameters for atLeast, atMost, exactly operations"""
@@ -106,7 +107,8 @@ class _ResourceStack(BaseModel):
     amount: int
     cost: float
     resource_id: str
-    
+    created_tick: int = 0   # tick at which this stack was produced/acquired
+
     @property
     def cost_per_unit(self):
         return self.cost / self.amount
@@ -205,6 +207,14 @@ _ResourceAmounts = Dict[str, Decimal]
 # Machines & Containers  (Container = Machine with inventory)
 # ----------------------------------------------------------------------------
 
+class MachinePort(BaseModel):
+    port_id: str                          # unique within machine e.g. "input_raw", "output_fuel"
+    local_x: int = 0                      # tile offset from machine grid_position origin
+    local_y: int = 0
+    face: Literal["north", "south", "east", "west"]  # which edge the conveyor connects from
+    resource_ids: List[str] = Field(default_factory=list)  # empty = any resource
+
+
 class MachineDefinition(BaseModel):
     """Blueprint for any interactive object occupying floor space."""
 
@@ -234,7 +244,9 @@ class MachineDefinition(BaseModel):
     # Some advanced machines can have conveyors to others
     conveyor_in_capacity: int = 0
     conveyor_out_capacity: int = 0
-    
+    input_ports: List[MachinePort] = Field(default_factory=list)
+    output_ports: List[MachinePort] = Field(default_factory=list)
+
     # What it takes to change the recipe of a machine
     # Typically only money
     change_recipe_cost: _ResourceAmounts = Field(default_factory=dict)
@@ -264,6 +276,8 @@ class _MachineInstance(BaseModel):
     machine: MachineDefinition
     is_active: bool = False
     stored_resources: Dict[str, Decimal] = Field(default_factory=dict)
+
+    grid_position: Optional[Tuple[int, int, int]] = None  # (x, y, floor) in building grid; None = unplaced
 
     # We only define where conveyors are going- the machine's inventory will be
     # updated with inbound conveyor items without this instance having to to anything.
@@ -312,22 +326,35 @@ class _UnitInstance(BaseModel):
     instance_id: int = Field(default_factory=get_instance_id)
     owner_company_id: str
     access_team_ids: List[str] = Field(default_factory=list)
-    floor_space: int = Field(..., description="Maximum usable space in tiles")
+
+    # Explicit tile ownership: each entry is (x, y, floor) in building grid.
+    tiles: List[Tuple[int, int, int]] = Field(default_factory=list)
+
+    # Keep floor_space as fallback for backward compat; if tiles non-empty, use len(tiles).
+    floor_space: int = Field(0, description="Fallback scalar; use len(tiles) when tiles populated")
+
     machines: List[_MachineInstance] = Field(default_factory=list)
 
     # financials (optional - extend as needed)
     purchase_price: Optional[Decimal] = None
     rent_price_per_tick: Optional[Decimal] = None
 
+    # purpose flag
+    unit_purpose: Literal["commercial", "residential"] = "commercial"
+
     # -- Helpers ------------------------------------------------------------
     def used_floor_space(self) -> int:
         return sum(m.machine.floor_space for m in self.machines)
 
     def free_floor_space(self) -> int:
-        return self.floor_space - self.used_floor_space()
+        effective = len(self.tiles) if self.tiles else self.floor_space
+        return effective - self.used_floor_space()
 
     def can_add_machine(self, machine: MachineDefinition) -> bool:
         return self.free_floor_space() >= machine.floor_space
+
+    def tile_set(self) -> set:
+        return {(x, y, f) for x, y, f in self.tiles}
 
     def add_machine(self, machine_def: MachineDefinition, *, active: bool = False) -> str:
         if not self.can_add_machine(machine_def):
@@ -339,6 +366,14 @@ class _UnitInstance(BaseModel):
 # ----------------------------------------------------------------------------
 # Buildings
 # ----------------------------------------------------------------------------
+
+class DecayState(str, Enum):
+    NORMAL      = "normal"
+    FIXER_UPPER = "fixer_upper"
+    ABANDONED   = "abandoned"
+    CONDEMNED   = "condemned"
+    COLLAPSED   = "collapsed"
+
 
 class BuildingType(BaseModel):
     name: str
@@ -356,15 +391,30 @@ class BuildingDefinition(BaseModel):
     floor_width: int
     floor_length: int
     floors: int
-    
+
     loading_bays: int
     parking_spots: int
-    
+
     building_type: BuildingType
+    public_access: bool = False  # True = citizens can shop here; False = employees/B2B only
+    residential: bool = False  # True = building is for residential use
+    max_maintenance_cost_per_tick: Decimal = Decimal('0')
+
+    # Cost per square foot to renovate up one decay tier
+    # Key = current DecayState that needs repair (e.g. "fixer_upper" means repairing to NORMAL)
+    repair_cost_per_sqft: Dict[str, Decimal] = Field(default_factory=dict)
 
     @validator("cost", pre=True)
     def _decimize(cls, v):  # noqa: N805
         return Decimal(str(v))
+
+    @validator("max_maintenance_cost_per_tick", pre=True)
+    def _decimize_maint(cls, v):
+        return Decimal(str(v))
+
+    @validator("repair_cost_per_sqft", pre=True)
+    def _decimize_repair(cls, v):
+        return {k: Decimal(str(val)) for k, val in v.items()}
 
     # derived ---------------------------------------------------------------
     @property
@@ -380,10 +430,17 @@ class _BuildingInstance(BaseModel):
     owner_company_id: str
     # units keyed by their IDs
     units: Dict[int, _UnitInstance] = Field(default_factory=dict)
-    
+    # Maps "x,y,floor" -> "machine:<instance_id>" or "conveyor:<instance_id>"
+    floor_grid: Dict[str, str] = Field(default_factory=dict)
+    # Maps "x,y,floor" -> unit_instance_id (which unit owns this tile)
+    unit_tile_map: Dict[str, int] = Field(default_factory=dict)
+
     loading_bay_occupants: List[str]
     parking_occupants: List[str]
     origin: Tuple[int, int] = Field(default_factory=lambda: (0, 0))
+    condition: float = 1.0          # 0.0–1.0 within current decay tier; resets to 1.0 on tier drop
+    decay_state: DecayState = DecayState.NORMAL
+    maintenance_level: float = 1.0  # owner-set 0.0–1.0; scales cost and recovery rate
 
     # -- Convenience --------------------------------------------------------
     def add_unit(self, unit: _UnitInstance) -> None:
@@ -404,6 +461,27 @@ class _BuildingInstance(BaseModel):
             return [m for u in self.units.values() for m in u.machines]
         else:
             return [m for u in self.units.values() for m in u.machines if u.owner_company_id == company_id]
+
+class _ConveyorSegment(BaseModel):
+    instance_id: int = Field(default_factory=get_instance_id)
+    building_id: int
+    position: Tuple[int, int, int]        # (x, y, floor_level) in building grid
+    level: int = 1                         # 1=ground, 3+=overhead (employees walk under)
+    direction_in: Tuple[int, int] = (1, 0) # unit vector of incoming flow direction
+    direction_out: Tuple[int, int] = (1, 0) # unit vector of outgoing flow (same=straight, perp=corner)
+
+
+class _ConveyorPath(BaseModel):
+    instance_id: int = Field(default_factory=get_instance_id)
+    building_id: int
+    source_machine_id: int
+    source_port_id: str
+    dest_machine_id: int
+    dest_port_id: str
+    resource_id: str
+    segment_ids: List[int] = Field(default_factory=list)  # ordered ConveyorSegment ids
+    active: bool = False
+
 
 # ----------------------------------------------------------------------------
 # Land
@@ -566,6 +644,14 @@ class _CompanyInstance(_FinancialEntityInstance):
     open_job_ids: List[int] = Field(default_factory=list)
     inbound_pending: Dict[str, Decimal] = Field(default_factory=dict)
     outbound_pending: Dict[str, Decimal] = Field(default_factory=dict)
+    owner_person_id: Optional[int] = None
+    input_frustration: Dict[str, float] = Field(default_factory=dict)
+    # Sum of all outstanding financed_amount across active loans
+    total_debt: Decimal = Decimal('0')
+    # Track acquisition tick for expiry (resource_id -> tick last significantly restocked)
+    resource_acquired_tick: Dict[str, int] = Field(default_factory=dict)
+    pending_conveyor_plans: List[Dict[str, Any]] = Field(default_factory=list)
+    renting_unit_ids: List[int] = Field(default_factory=list)
 
 # Simple resource-conversion recipe (updated to reference machine *IDs*)
 class ResourceConversion(BaseModel):
@@ -576,6 +662,7 @@ class ResourceConversion(BaseModel):
     input_resources: _ResourceAmounts
     output_resources: _ResourceAmounts
     default_time_taken: Decimal = Field(default_factory=lambda: Decimal(0))
+    domain: Optional[str] = None
 
     @validator("input_resources", "output_resources", pre=True)
     def _decimize_map(cls, v):  # noqa: N805
@@ -609,6 +696,22 @@ class _JobSlot(BaseModel):
     team_id: Optional[str] = None
     department_id: Optional[str] = None
     segment_id: Optional[str] = None
+
+class _Loan(BaseModel):
+    instance_id: int = Field(default_factory=get_instance_id)
+    borrower_type: Literal["company", "person"]
+    borrower_id: int
+    principal: Decimal              # original full principal
+    financed_amount: Decimal        # principal * (1 - down_pct) — what's actually owed
+    monthly_payment: Decimal        # financed_amount / term_months
+    term_months: int
+    payments_made: int = 0
+    payments_missed: int = 0        # consecutive missed payments
+    # Tick at which next payment is due
+    next_payment_tick: int = 0
+    # If in liquidation window: tick at which bank seizes assets
+    liquidation_deadline_tick: Optional[int] = None
+    issued_tick: int = 0
 
 class EducationCategory(BaseModel):
     id: str
@@ -646,13 +749,16 @@ class EducationCategory(BaseModel):
 class Personality(BaseModel):
     """Personality traits affecting economic behaviour."""
     weight: int = 1 # Probability of a specific personality governed by weight
-    
+
     comfort_value: float = 1.0 # How much this person values high-quality items
     time_value: float = 1.0 # How much this person values time ($/tick). Can also be understood as a quantifiation of impatience
     info_sharing: float = 0.5 # How likely this person is to share information that they have learned
     marketing_susceptibility: float = 0.5 # How likely this person is to believe marketing
+    risk_tolerance: float = 0.5    # 0-1, willingness to take financial risk
+    adaptability: float = 0.5      # 0-1, base learning speed and openness to new domains
     
 class _PersonInstance(_FinancialEntityInstance):
+    age: float = 25.0
     education: Optional[EducationCategory] = None
 
     # Dictionary of PersonInstance to a 0-1 chance that they will share information with that Person
@@ -661,7 +767,7 @@ class _PersonInstance(_FinancialEntityInstance):
     job_slot_id: Optional[int] = None
     employer_id: Optional[int] = None
     works_at: Optional[int] = None
-    
+
     inventory: _Inventory
 
     personality: Personality = Field(default_factory=Personality)
@@ -674,11 +780,52 @@ class _PersonInstance(_FinancialEntityInstance):
     active_demands: Dict[str, int] = Field(default_factory=dict)
     demand_cooldowns: Dict[str, int] = Field(default_factory=dict)
 
+    owner_company_id: Optional[int] = None
+    home_building_id: Optional[int] = None
+    home_unit_id: Optional[int] = None
+    known_conversions: List[str] = Field(default_factory=list)
+    # Maps company_id -> list of resource_ids they've seen for sale
+    known_products: Dict[int, List[str]] = Field(default_factory=dict)
+    # Education accumulation: domain_id -> ticks spent working in that domain
+    education_ticks: Dict[str, int] = Field(default_factory=dict)
+    # Career tracking
+    employment_ticks: int = 0          # total ticks employed at current company
+    current_role: Optional[str] = None # JobRole value of current job
+    venture_frustration: Dict[str, float] = Field(default_factory=dict)
+    venture_cooldown: int = 0
+    total_debt: Decimal = Decimal('0')
+    # Flag set when person has no assets and no way to repay — game-over condition
+    in_debtors_prison: bool = False
+
+    @property
+    def effective_adaptability(self) -> float:
+        return age_decay(self.personality.adaptability, self.age, 25.0, 0.07, 0.05)
+
+    @property
+    def effective_risk_tolerance(self) -> float:
+        return age_decay(self.personality.risk_tolerance, self.age, 30.0, 0.04, 0.10)
+
     @model_validator(mode="before")
     def init_inventory(cls, values):
         cap = 5
         values['inventory'] = _Inventory(capacity=cap)
         return values
+
+class ListingType(str, Enum):
+    FOR_RENT = "for_rent"
+    FOR_SALE = "for_sale"
+
+
+class _RealEstateListing(BaseModel):
+    instance_id: int = Field(default_factory=get_instance_id)
+    building_id: int
+    unit_id: int
+    listing_type: ListingType
+    asking_price: Optional[Decimal] = None      # set for FOR_SALE
+    rent_per_tick: Optional[Decimal] = None     # set for FOR_RENT
+    listed_by_company_id: int
+    listed_at_tick: int = 0
+
 
 class _WorldState(BaseModel):
     land: Dict[str, _LandParcel] = Field(default_factory=dict)
@@ -689,7 +836,11 @@ class _WorldState(BaseModel):
     registry: Dict[str, dict] = Field(default_factory=dict)
 
     jobs: Dict[int, _JobSlot] = Field(default_factory=dict)
+    loans: Dict[int, _Loan] = Field(default_factory=dict)
     analytics: _AnalyticsSeries = Field(default_factory=_AnalyticsSeries)
+    conveyor_segments: Dict[int, _ConveyorSegment] = Field(default_factory=dict)
+    conveyor_paths: Dict[int, _ConveyorPath] = Field(default_factory=dict)
+    real_estate_listings: Dict[int, "_RealEstateListing"] = Field(default_factory=dict)
 
     # -- Helper methods -----------------------------------------------------
     def post_job(self, company_id: int, role: JobRole, wage: Decimal) -> int:
@@ -749,3 +900,60 @@ class _WorldState(BaseModel):
         del building.units[unit_a]
         del building.units[unit_b]
         return new_unit.instance_id
+
+    def list_unit_for_rent(self, building_id: int, unit_id: int, company_id: int, rent_per_tick: Decimal, tick: int) -> int:
+        """Create or update a FOR_RENT listing. Returns listing_id."""
+        for lid, lst in list(self.real_estate_listings.items()):
+            if lst.building_id == building_id and lst.unit_id == unit_id:
+                del self.real_estate_listings[lid]
+        listing = _RealEstateListing(
+            building_id=building_id, unit_id=unit_id,
+            listing_type=ListingType.FOR_RENT,
+            rent_per_tick=rent_per_tick,
+            listed_by_company_id=company_id,
+            listed_at_tick=tick,
+        )
+        self.real_estate_listings[listing.instance_id] = listing
+        return listing.instance_id
+
+    def list_unit_for_sale(self, building_id: int, unit_id: int, company_id: int, asking_price: Decimal, tick: int) -> int:
+        """Create or update a FOR_SALE listing."""
+        for lid, lst in list(self.real_estate_listings.items()):
+            if lst.building_id == building_id and lst.unit_id == unit_id:
+                del self.real_estate_listings[lid]
+        listing = _RealEstateListing(
+            building_id=building_id, unit_id=unit_id,
+            listing_type=ListingType.FOR_SALE,
+            asking_price=asking_price,
+            listed_by_company_id=company_id,
+            listed_at_tick=tick,
+        )
+        self.real_estate_listings[listing.instance_id] = listing
+        return listing.instance_id
+
+    def remove_listing(self, building_id: int, unit_id: int) -> None:
+        """Remove any listing for a unit."""
+        to_delete = [lid for lid, lst in self.real_estate_listings.items()
+                     if lst.building_id == building_id and lst.unit_id == unit_id]
+        for lid in to_delete:
+            del self.real_estate_listings[lid]
+
+    def available_rentals(self) -> List["_RealEstateListing"]:
+        """Return all FOR_RENT listings for unoccupied commercial units."""
+        result = []
+        for lst in self.real_estate_listings.values():
+            if lst.listing_type != ListingType.FOR_RENT:
+                continue
+            building = self.buildings.get(lst.building_id)
+            if not building:
+                continue
+            unit = building.units.get(lst.unit_id)
+            if not unit:
+                continue
+            if unit.unit_purpose != "commercial":
+                continue
+            if not unit.access_team_ids or all(
+                tid == str(unit.owner_company_id) for tid in unit.access_team_ids
+            ):
+                result.append(lst)
+        return result

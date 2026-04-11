@@ -31,10 +31,18 @@ def _init_simulation(seed: int = 0) -> tuple[G._WorldState, sim.BehaviorManager]
     bm = sim.BehaviorManager(world, markets, marketing_market, seed=seed)
     bm.register(sim.MarketBehavior())
     bm.register(sim.CompanyBehavior())
-    bm.register(sim.PersonBehavior())
-    bm.register(sim.MarketingBehavior())
+    bm.register(sim.LogisticsBehavior())
     bm.register(sim.VehicleBehavior())
     bm.register(sim.MachineBehavior())
+    bm.register(sim.ExpirationBehavior())
+    bm.register(sim.RealEstateBehavior())
+    bm.register(sim.PersonBehavior())
+    bm.register(sim.LifecycleBehavior())
+    bm.register(sim.DiscoveryBehavior())
+    bm.register(sim.MarketingBehavior())
+    bm.register(sim.EntrepreneurshipBehavior())
+    bm.register(sim.AnalyticsBehavior())
+    bm.register(sim.BankBehavior())
     return world, bm
 
 # ------------------------------------------------------------------------------

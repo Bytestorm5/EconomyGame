@@ -8,7 +8,5 @@
     "id": "liquid"
   },
   "market_behavior": "commodity",
-  "fulfills_demand": {
-    "commute": 1.0
-  }
+  "fulfills_demand": {}
 }

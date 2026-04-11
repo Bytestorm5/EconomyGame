@@ -10,5 +10,12 @@
   "floors": 1,
   "loading_bays": 1,
   "parking_spots": 2,
-  "building_type": {"name": "Factory"}
+  "building_type": {"name": "Factory"},
+  "public_access": false,
+  "max_maintenance_cost_per_tick": "0.05",
+  "repair_cost_per_sqft": {
+    "fixer_upper": "33",
+    "abandoned": "50",
+    "condemned": "75"
+  }
 }

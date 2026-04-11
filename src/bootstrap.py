@@ -6,6 +6,63 @@ import random
 
 import objects as G
 
+# ---------------------------------------------------------------------------
+# Footprint helpers
+# ---------------------------------------------------------------------------
+
+def _find_buildable_origin(
+    world: G._WorldState,
+    width: int,
+    height: int,
+    x_range: range,
+    y_range: range,
+) -> Optional[Tuple[int, int]]:
+    """Return first (x, y) origin where a width x height footprint is entirely WILD_BUILDABLE."""
+    for x in x_range:
+        for y in y_range:
+            if all(
+                world.land.get(f"{x+dx}-{y+dy}", G._LandParcel(x=x+dx, y=y+dy, state_id=G.LandState.WILD_UNBUILDABLE)).state_id == G.LandState.WILD_BUILDABLE
+                for dx in range(width)
+                for dy in range(height)
+            ):
+                return (x, y)
+    return None
+
+
+def claim_building_footprint(world: G._WorldState, bdef: G.BuildingDefinition, origin: Tuple[int, int], owner_company_id: str, building_id: int) -> None:
+    """Mark all tiles in the building footprint as BUILDING."""
+    ox, oy = origin
+    for dx in range(bdef.floor_width):
+        for dy in range(bdef.floor_length):
+            parcel = _get_or_create_parcel(world, (ox + dx, oy + dy))
+            parcel.state_id = G.LandState.BUILDING
+            parcel.owner_company_id = owner_company_id
+            parcel.building_id = str(building_id)
+
+
+def release_building_footprint(world: G._WorldState, building: G._BuildingInstance) -> None:
+    """Release all footprint tiles back to WILD_BUILDABLE."""
+    ox, oy = building.origin
+    bdef = building.definition
+    for dx in range(bdef.floor_width):
+        for dy in range(bdef.floor_length):
+            key = f"{ox+dx}-{oy+dy}"
+            parcel = world.land.get(key)
+            if parcel and parcel.building_id == str(building.instance_id):
+                parcel.state_id = G.LandState.WILD_BUILDABLE
+                parcel.owner_company_id = None
+                parcel.building_id = None
+
+
+def validate_footprint(world: G._WorldState, bdef: G.BuildingDefinition, origin: Tuple[int, int]) -> bool:
+    """Return True if all footprint tiles are WILD_BUILDABLE."""
+    ox, oy = origin
+    return all(
+        world.land.get(f"{ox+dx}-{oy+dy}", G._LandParcel(x=ox+dx, y=oy+dy, state_id=G.LandState.WILD_UNBUILDABLE)).state_id == G.LandState.WILD_BUILDABLE
+        for dx in range(bdef.floor_width)
+        for dy in range(bdef.floor_length)
+    )
+
 DEFAULT_MAP_WIDTH = 30
 DEFAULT_MAP_HEIGHT = 20
 
@@ -82,15 +139,6 @@ def ensure_content_baseline(
             type=G.ResourceType(id="liquid"),
             market_behavior="commodity",
             fulfills_demand={},
-        )
-    if "commute" not in demand_defs:
-        demand_defs["commute"] = G.ResourceDemand(
-            id="commute",
-            is_need=True,
-            quantity=1,
-            min_time_until_repeat=4,
-            demand_can_occur=None,
-            chance_per_tick=0.15,
         )
     if "comfort" not in demand_defs:
         demand_defs["comfort"] = G.ResourceDemand(
@@ -181,7 +229,7 @@ SCENARIO_COMPANIES = [
         "buildings": [
             {
                 "kind": "Factory",
-                "tile": (6, 15),
+                "tile": (8, 2),
                 "machines": [
                     {"machine_id": "farm", "recipe": "farm_raw_food", "active": True, "count": 6},
                     {"machine_id": "warehouse", "recipe": None, "active": False, "count": 1}
@@ -189,8 +237,8 @@ SCENARIO_COMPANIES = [
             }
         ],
         "vehicles": [
-            {"vehicle_id": "truck", "tile": (6, 14), "fuel": "120"},
-            {"vehicle_id": "truck", "tile": (5, 14), "fuel": "120"}
+            {"vehicle_id": "truck", "tile": (8, 1), "fuel": "120"},
+            {"vehicle_id": "truck", "tile": (9, 1), "fuel": "120"}
         ],
         "jobs": [
             {"role": "operator", "wage": "25", "count": 6}
@@ -224,7 +272,7 @@ SCENARIO_COMPANIES = [
         "buildings": [
             {
                 "kind": "Factory",
-                "tile": (10, 15),
+                "tile": (16, 2),
                 "machines": [
                     {"machine_id": "cooker", "recipe": "cook_food", "active": True, "count": 4},
                     {"machine_id": "kitchen", "recipe": "prepare_convenience_food", "active": True, "count": 2},
@@ -233,7 +281,7 @@ SCENARIO_COMPANIES = [
             }
         ],
         "vehicles": [
-            {"vehicle_id": "truck", "tile": (10, 14), "fuel": "100"}
+            {"vehicle_id": "truck", "tile": (16, 1), "fuel": "100"}
         ],
         "jobs": [
             {"role": "operator", "wage": "32", "count": 5}
@@ -268,14 +316,14 @@ SCENARIO_COMPANIES = [
         "buildings": [
             {
                 "kind": "Retail",
-                "tile": (10, 12),
+                "tile": (21, 6),
                 "machines": [
                     {"machine_id": "warehouse", "recipe": None, "active": False, "count": 3}
                 ]
             }
         ],
         "vehicles": [
-            {"vehicle_id": "truck", "tile": (10, 11), "fuel": "80"}
+            {"vehicle_id": "truck", "tile": (25, 7), "fuel": "80"}
         ],
         "jobs": [
             {"role": "operator", "wage": "22", "count": 5}
@@ -287,7 +335,9 @@ SCENARIO_COMPANIES = [
             "money": "26000",
             "fuel": "140",
             "shares": "1000000",
-            "crude_oil": "60"
+            "crude_oil": "60",
+            "conveyor_segment": "50",
+            "conveyor_segment_overhead": "20"
         },
         "focus": ["fuel", "crude_oil"],
         "planning_horizon": 24 * 40,
@@ -306,7 +356,7 @@ SCENARIO_COMPANIES = [
         "buildings": [
             {
                 "kind": "Factory",
-                "tile": (4, 15),
+                "tile": (2, 2),
                 "machines": [
                     {"machine_id": "oil_well", "recipe": "pump_crude_oil", "active": True, "count": 2},
                     {"machine_id": "refinery", "recipe": "refine_fuel", "active": True, "count": 2},
@@ -315,8 +365,8 @@ SCENARIO_COMPANIES = [
             }
         ],
         "vehicles": [
-            {"vehicle_id": "truck", "tile": (4, 14), "fuel": "120"},
-            {"vehicle_id": "truck", "tile": (5, 14), "fuel": "120"}
+            {"vehicle_id": "truck", "tile": (2, 1), "fuel": "120"},
+            {"vehicle_id": "truck", "tile": (3, 1), "fuel": "120"}
         ],
         "jobs": [
             {"role": "operator", "wage": "28", "count": 4}
@@ -332,6 +382,26 @@ def _find_building_def(defs: Sequence[G.BuildingDefinition], kind: str) -> G.Bui
         if definition.building_type.name.lower() == kind.lower():
             return definition
     raise KeyError(f"No building definition for kind '{kind}'")
+
+
+def assign_unit_tiles(
+    building: G._BuildingInstance,
+    unit: G._UnitInstance,
+    origin_x: int,
+    origin_y: int,
+    width: int,
+    height: int,
+    floor: int = 0,
+) -> None:
+    """Assign a rectangular block of tiles to a unit, populating unit_tile_map."""
+    tiles = []
+    for dy in range(height):
+        for dx in range(width):
+            tiles.append((origin_x + dx, origin_y + dy, floor))
+    unit.tiles = tiles
+    unit.floor_space = len(tiles)
+    for x, y, f in tiles:
+        building.unit_tile_map[f"{x},{y},{f}"] = unit.instance_id
 
 
 def _create_building(
@@ -353,6 +423,7 @@ def _create_building(
     )
     unit = G._UnitInstance(owner_company_id=str(company.instance_id), floor_space=bdef.floor_area)
     building.add_unit(unit)
+    assign_unit_tiles(building, unit, 0, 0, bdef.floor_width, bdef.floor_length)
 
     for machine_spec in spec.get("machines", []):
         machine_def = machine_defs.get(machine_spec["machine_id"])
@@ -364,14 +435,21 @@ def _create_building(
             machine_inst = unit.machines[-1]
             machine_inst.recipe = machine_spec.get("recipe")
             machine_inst.is_active = machine_spec.get("active", False)
+            # Inline auto-placement: assign sequential positions at bootstrap time
+            if machine_inst.grid_position is None:
+                placed_tiles = sum(
+                    m.machine.floor_space for m in unit.machines[:-1] if m.grid_position is not None
+                )
+                machine_inst.grid_position = (placed_tiles, 0, 0)
+                for dx in range(machine_inst.machine.floor_space):
+                    building.floor_grid[f"{placed_tiles + dx},0,0"] = f"machine:{machine_inst.instance_id}"
+
+    if not validate_footprint(world, bdef, tuple(spec["tile"])):
+        raise ValueError(f"Building footprint at {spec['tile']} overlaps occupied tiles")
 
     world.buildings[building.instance_id] = building
     company.buildings.append(building.instance_id)
-
-    parcel = _get_or_create_parcel(world, tuple(spec["tile"]))
-    parcel.state_id = G.LandState.BUILDING
-    parcel.owner_company_id = str(company.instance_id)
-    parcel.building_id = str(building.instance_id)
+    claim_building_footprint(world, bdef, tuple(spec["tile"]), str(company.instance_id), building.instance_id)
     return building
 
 
@@ -499,16 +577,18 @@ def ensure_population(
 
     for _ in range(size):
         cash = _decimal_from_float(rng.uniform(350, 900))
-        personality = G.Personality(
-            comfort_value=round(rng.uniform(0.8, 1.3), 3),
-            time_value=round(rng.uniform(0.6, 1.4), 3),
-            info_sharing=round(rng.uniform(0.2, 0.8), 3),
-            marketing_susceptibility=round(rng.uniform(0.1, 0.9), 3),
-        )
         person = G._PersonInstance(
-            resources={"money": cash},
+            age=rng.uniform(18.0, 62.0),
+            resources={'money': cash},
             personal_relationship={},
-            personality=personality,
+            personality=G.Personality(
+                comfort_value=round(rng.uniform(0.8, 1.3), 3),
+                time_value=round(rng.uniform(0.6, 1.4), 3),
+                info_sharing=round(rng.uniform(0.2, 0.8), 3),
+                marketing_susceptibility=round(rng.uniform(0.1, 0.9), 3),
+                risk_tolerance=round(rng.uniform(0.2, 0.9), 3),
+                adaptability=round(rng.uniform(0.15, 0.95), 3),
+            ),
         )
         # basic awareness
         if company_ids:
